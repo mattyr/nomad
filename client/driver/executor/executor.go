@@ -406,11 +406,12 @@ func (e *UniversalExecutor) SyncServices(ctx *ConsulContext) error {
 	e.logger.Printf("[INFO] executor: registering services")
 	e.consulCtx = ctx
 	if e.consulService == nil {
-		cs, err := consul.NewConsulService(ctx.ConsulConfig, e.logger, e.ctx.AllocID)
+		cs, err := consul.NewConsulService(ctx.ConsulConfig, e.logger)
 		if err != nil {
 			return err
 		}
 		cs.SetDelegatedChecks(e.createCheckMap(), e.createCheck)
+		cs.SetAllocID(e.ctx.AllocID)
 		e.consulService = cs
 	}
 	if e.ctx != nil {

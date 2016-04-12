@@ -60,7 +60,7 @@ const (
 )
 
 // NewConsulService returns a new ConsulService
-func NewConsulService(config *ConsulConfig, logger *log.Logger, allocID string) (*ConsulService, error) {
+func NewConsulService(config *ConsulConfig, logger *log.Logger) (*ConsulService, error) {
 	var err error
 	var c *consul.Client
 	cfg := consul.DefaultConfig()
@@ -114,7 +114,6 @@ func NewConsulService(config *ConsulConfig, logger *log.Logger, allocID string) 
 	}
 	consulService := ConsulService{
 		client:          c,
-		allocID:         allocID,
 		logger:          logger,
 		trackedServices: make(map[string]*consul.AgentService),
 		trackedChecks:   make(map[string]*consul.AgentCheckRegistration),
@@ -130,6 +129,12 @@ func NewConsulService(config *ConsulConfig, logger *log.Logger, allocID string) 
 func (c *ConsulService) SetDelegatedChecks(delegateChecks map[string]struct{}, createCheck func(*structs.ServiceCheck, string) (Check, error)) *ConsulService {
 	c.delegateChecks = delegateChecks
 	c.createCheck = createCheck
+	return c
+}
+
+// SetAllocID sets the allocID
+func (c *ConsulService) SetAllocID(allocID string) *ConsulService {
+	c.allocID = allocID
 	return c
 }
 
