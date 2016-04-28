@@ -73,3 +73,11 @@ type CheckResult struct {
 	Timestamp time.Time
 	Err       error
 }
+
+type MemoryStats struct {
+	RSS uint64
+}
+
+type TaskResourceUsage struct {
+	MemoryStats *MemoryStats
+}
