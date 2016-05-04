@@ -137,7 +137,7 @@ func GetTaskEnv(allocDir *allocdir.AllocDir, node *structs.Node,
 	task *structs.Task, alloc *structs.Allocation) (*env.TaskEnvironment, error) {
 
 	tg := alloc.Job.LookupTaskGroup(alloc.TaskGroup)
-	env := env.NewTaskEnvironment(node).
+	env := env.NewTaskEnvironment(node, task.ExcludeNomadEnv).
 		SetTaskMeta(task.Meta).
 		SetTaskGroupMeta(tg.Meta).
 		SetJobMeta(alloc.Job.Meta).

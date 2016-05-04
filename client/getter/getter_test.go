@@ -39,7 +39,7 @@ func TestGetArtifact_FileAndChecksum(t *testing.T) {
 	}
 
 	// Download the artifact
-	taskEnv := env.NewTaskEnvironment(mock.Node())
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false)
 	logger := log.New(os.Stderr, "", log.LstdFlags)
 	if err := GetArtifact(taskEnv, artifact, taskDir, logger); err != nil {
 		t.Fatalf("GetArtifact failed: %v", err)
@@ -75,7 +75,7 @@ func TestGetArtifact_File_RelativeDest(t *testing.T) {
 	}
 
 	// Download the artifact
-	taskEnv := env.NewTaskEnvironment(mock.Node())
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false)
 	logger := log.New(os.Stderr, "", log.LstdFlags)
 	if err := GetArtifact(taskEnv, artifact, taskDir, logger); err != nil {
 		t.Fatalf("GetArtifact failed: %v", err)
@@ -94,7 +94,7 @@ func TestGetGetterUrl_Interprolation(t *testing.T) {
 	}
 
 	url := "foo.com"
-	taskEnv := env.NewTaskEnvironment(mock.Node()).SetTaskMeta(map[string]string{"artifact": url})
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false).SetTaskMeta(map[string]string{"artifact": url})
 	act, err := getGetterUrl(taskEnv, artifact)
 	if err != nil {
 		t.Fatalf("getGetterUrl() failed: %v", err)
@@ -127,7 +127,7 @@ func TestGetArtifact_InvalidChecksum(t *testing.T) {
 	}
 
 	// Download the artifact and expect an error
-	taskEnv := env.NewTaskEnvironment(mock.Node())
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false)
 	logger := log.New(os.Stderr, "", log.LstdFlags)
 	if err := GetArtifact(taskEnv, artifact, taskDir, logger); err == nil {
 		t.Fatalf("GetArtifact should have failed")
@@ -194,7 +194,7 @@ func TestGetArtifact_Archive(t *testing.T) {
 		},
 	}
 
-	taskEnv := env.NewTaskEnvironment(mock.Node())
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false)
 	logger := log.New(os.Stderr, "", log.LstdFlags)
 	if err := GetArtifact(taskEnv, artifact, taskDir, logger); err != nil {
 		t.Fatalf("GetArtifact failed: %v", err)

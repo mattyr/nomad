@@ -83,18 +83,19 @@ type LogConfig struct {
 
 // Task is a single process in a task group.
 type Task struct {
-	Name        string
-	Driver      string
-	User        string
-	Config      map[string]interface{}
-	Constraints []*Constraint
-	Env         map[string]string
-	Services    []Service
-	Resources   *Resources
-	Meta        map[string]string
-	KillTimeout time.Duration
-	LogConfig   *LogConfig
-	Artifacts   []*TaskArtifact
+	Name            string
+	Driver          string
+	User            string
+	Config          map[string]interface{}
+	Constraints     []*Constraint
+	Env             map[string]string
+	ExcludeNomadEnv bool
+	Services        []Service
+	Resources       *Resources
+	Meta            map[string]string
+	KillTimeout     time.Duration
+	LogConfig       *LogConfig
+	Artifacts       []*TaskArtifact
 }
 
 // TaskArtifact is used to download artifacts before running a task.

@@ -463,6 +463,7 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 			"driver",
 			"user",
 			"env",
+			"exclude_nomad_env",
 			"service",
 			"config",
 			"constraint",
@@ -482,6 +483,7 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 		}
 		delete(m, "config")
 		delete(m, "env")
+		delete(m, "exclude_nomad_env")
 		delete(m, "constraint")
 		delete(m, "service")
 		delete(m, "meta")
