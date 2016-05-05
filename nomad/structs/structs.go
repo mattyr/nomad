@@ -1566,8 +1566,33 @@ const (
 
 // LogConfig provides configuration for log rotation
 type LogConfig struct {
-	MaxFiles      int `mapstructure:"max_files"`
-	MaxFileSizeMB int `mapstructure:"max_file_size"`
+	MaxFiles         int `mapstructure:"max_files"`
+	MaxFileSizeMB    int `mapstructure:"max_file_size"`
+	LogShuttleConfig *LogShuttleConfig
+}
+
+// LogShuttleConfig configures log-shuttle log delivery
+type LogShuttleConfig struct {
+	UseGzip       bool
+	Drop          bool
+	Prival        string
+	Version       string
+	Procid        string
+	Appname       string
+	LogplexToken  string
+	Hostname      string
+	Msgid         string
+	LogsURL       string
+	StatsSource   string
+	StatsInterval time.Duration
+	WaitDuration  time.Duration
+	Timeout       time.Duration
+	MaxAttempts   int
+	NumOutlets    int
+	BatchSize     int
+	BackBuff      int
+	MaxLineLength int
+	KinesisShards int
 }
 
 func DefaultLogConfig() *LogConfig {

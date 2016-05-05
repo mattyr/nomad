@@ -28,7 +28,7 @@ func (e *UniversalExecutor) LaunchSyslogServer(ctx *ExecutorContext) (*SyslogSer
 		return nil, err
 	}
 
-	e.syslogServer = logging.NewSyslogServer(l, e.syslogChan, e.logger)
+	e.syslogServer = logging.NewSyslogServer(l, nil, e.syslogChan, e.logger)
 	go e.syslogServer.Start()
 	go e.collectLogs(e.lre, e.lro)
 	syslogAddr := fmt.Sprintf("%s://%s", l.Addr().Network(), l.Addr().String())

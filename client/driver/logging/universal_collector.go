@@ -63,7 +63,9 @@ type SyslogCollector struct {
 	lro        *FileRotator
 	lre        *FileRotator
 	server     *SyslogServer
+	shuttler   *Shuttler
 	syslogChan chan *SyslogMessage
+	rawChan    chan []byte
 	taskDir    string
 
 	logger *log.Logger
@@ -71,7 +73,11 @@ type SyslogCollector struct {
 
 // NewSyslogCollector returns an implementation of the SyslogCollector
 func NewSyslogCollector(logger *log.Logger) *SyslogCollector {
-	return &SyslogCollector{logger: logger, syslogChan: make(chan *SyslogMessage, 2048)}
+	return &SyslogCollector{
+		logger:     logger,
+		syslogChan: make(chan *SyslogMessage, 2048),
+		rawChan:    make(chan []byte, 2048),
+	}
 }
 
 // LaunchCollector launches a new syslog server and starts writing log lines to
@@ -88,7 +94,16 @@ func (s *SyslogCollector) LaunchCollector(ctx *LogCollectorContext) (*SyslogColl
 		return nil, err
 	}
 
-	s.server = NewSyslogServer(l, s.syslogChan, s.logger)
+	if s.logConfig.LogShuttleConfig != nil {
+		s.server = NewSyslogServer(l, s.rawChan, s.syslogChan, s.logger)
+		shuttler, err := NewShuttler(s.logConfig.LogShuttleConfig, s.logger)
+		if err != nil {
+			return nil, err
+		}
+		s.shuttler = shuttler
+	} else {
+		s.server = NewSyslogServer(l, nil, s.syslogChan, s.logger)
+	}
 	go s.server.Start()
 	logFileSize := int64(ctx.LogConfig.MaxFileSizeMB * 1024 * 1024)
 
@@ -108,6 +123,9 @@ func (s *SyslogCollector) LaunchCollector(ctx *LogCollectorContext) (*SyslogColl
 	s.lre = lre
 
 	go s.collectLogs(lre, lro)
+	if s.shuttler != nil {
+		go s.shuttleLogs()
+	}
 	syslogAddr := fmt.Sprintf("%s://%s", l.Addr().Network(), l.Addr().String())
 	return &SyslogCollectorState{Addr: syslogAddr}, nil
 }
@@ -126,8 +144,17 @@ func (s *SyslogCollector) collectLogs(we io.Writer, wo io.Writer) {
 	}
 }
 
+func (s *SyslogCollector) shuttleLogs() {
+	for rawBytes := range s.rawChan {
+		s.shuttler.Write(rawBytes)
+	}
+}
+
 // Exit kills the syslog server
 func (s *SyslogCollector) Exit() error {
+	if s.shuttler != nil {
+		s.shuttler.Shutdown()
+	}
 	s.server.Shutdown()
 	s.lre.Close()
 	s.lro.Close()
