@@ -75,10 +75,37 @@ func (g *TaskGroup) AddTask(t *Task) *TaskGroup {
 	return g
 }
 
-// LogConfig provides configuration for log rotation
+// LogConfig provides configuration for log saving and delivery
 type LogConfig struct {
-	MaxFiles      int
-	MaxFileSizeMB int
+	MaxFiles         int
+	MaxFileSizeMB    int
+	LogShuttleConfig *LogShuttleConfig
+}
+
+// LogShuttleConfig configures log-shuttle log delivery
+type LogShuttleConfig struct {
+	UseGzip       bool
+	Drop          bool
+	SkipHeaders   bool
+	LogToSyslog   bool
+	Prival        string
+	Version       string
+	Procid        string
+	Appname       string
+	LogplexToken  string
+	Hostname      string
+	Msgid         string
+	LogsURL       string
+	StatsSource   string
+	StatsInterval time.Duration
+	WaitDuration  time.Duration
+	Timeout       time.Duration
+	MaxAttempts   int
+	NumOutlets    int
+	BatchSize     int
+	BackBuff      int
+	MaxLineLength int
+	KinesisShards int
 }
 
 // Task is a single process in a task group.

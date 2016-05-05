@@ -12,6 +12,7 @@ import (
 // SyslogServer is a server which listens to syslog messages and parses them
 type SyslogServer struct {
 	listener net.Listener
+	raw      chan []byte
 	messages chan *SyslogMessage
 	parser   *DockerLogParser
 
@@ -23,10 +24,11 @@ type SyslogServer struct {
 }
 
 // NewSyslogServer creates a new syslog server
-func NewSyslogServer(l net.Listener, messages chan *SyslogMessage, logger *log.Logger) *SyslogServer {
+func NewSyslogServer(l net.Listener, raw chan []byte, messages chan *SyslogMessage, logger *log.Logger) *SyslogServer {
 	parser := NewDockerLogParser(logger)
 	return &SyslogServer{
 		listener: l,
+		raw:      raw,
 		messages: messages,
 		parser:   parser,
 		logger:   logger,
@@ -67,6 +69,9 @@ func (s *SyslogServer) read(connection net.Conn) {
 			b := scanner.Bytes()
 			msg := s.parser.Parse(b)
 			s.messages <- msg
+			if s.raw != nil {
+				s.raw <- b
+			}
 		} else {
 			return
 		}

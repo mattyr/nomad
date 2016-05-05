@@ -147,6 +147,13 @@
 			"revision": "36e9cfdd690967f4f690c6edcc9ffacd006014a0"
 		},
 		{
+			"checksumSHA1": "vT1wMN8o/fVLPCehp/vIZuqtjHY=",
+			"origin": "github.com/heroku/log-shuttle/vendor/github.com/bmizerany/aws4",
+			"path": "github.com/bmizerany/aws4",
+			"revision": "6a79a10d65cd25fb82aa48c70fe232664046a35e",
+			"revisionTime": "2016-04-27T17:01:48Z"
+		},
+		{
 			"comment": "v1.2.0",
 			"path": "github.com/boltdb/bolt",
 			"revision": "c6ba97b89e0454fec9aa92e1d33a4e2c5fc1f631"
@@ -463,6 +470,12 @@
 			"revision": "df949784da9ed028ee76df44652e42d37a09d7e4"
 		},
 		{
+			"checksumSHA1": "5iEEyveRJDnZYvjmzU67JplbHsw=",
+			"path": "github.com/heroku/log-shuttle",
+			"revision": "6a79a10d65cd25fb82aa48c70fe232664046a35e",
+			"revisionTime": "2016-04-27T17:01:48Z"
+		},
+		{
 			"comment": "0.2.2-2-gc01cf91",
 			"path": "github.com/jmespath/go-jmespath",
 			"revision": "c01cf91b011868172fdcd9f41838e80c9d716264"
@@ -523,6 +536,20 @@
 			"comment": "v0.0.9-108-g89ab7f2",
 			"path": "github.com/opencontainers/runc/libcontainer/utils",
 			"revision": "89ab7f2ccc1e45ddf6485eaa802c35dcf321dfc8"
+		},
+		{
+			"checksumSHA1": "ayRaLmkRnALRhJ4UwpKIHk9kfXo=",
+			"origin": "github.com/heroku/log-shuttle/vendor/github.com/pborman/uuid",
+			"path": "github.com/pborman/uuid",
+			"revision": "6a79a10d65cd25fb82aa48c70fe232664046a35e",
+			"revisionTime": "2016-04-27T17:01:48Z"
+		},
+		{
+			"checksumSHA1": "++cbFhQPKcItFHSkDmTFs3OlNZs=",
+			"origin": "github.com/heroku/log-shuttle/vendor/github.com/rcrowley/go-metrics",
+			"path": "github.com/rcrowley/go-metrics",
+			"revision": "6a79a10d65cd25fb82aa48c70fe232664046a35e",
+			"revisionTime": "2016-04-27T17:01:48Z"
 		},
 		{
 			"comment": "v2.0.1-8-g983d3a5",
