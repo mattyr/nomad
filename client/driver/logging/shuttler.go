@@ -19,6 +19,8 @@ func NewShuttler(config *structs.LogShuttleConfig, logger *log.Logger) (*Shuttle
 	s := shuttle.NewShuttle(sConfig)
 
 	pr, pw := io.Pipe()
+	s.Logger = logger
+	s.ErrLogger = logger
 	s.LoadReader(pr)
 
 	s.Launch()
