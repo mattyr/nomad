@@ -90,6 +90,9 @@ type TaskEnvironment struct {
 	Networks        []*structs.NetworkResource
 	PortMap         map[string]int
 
+	// fullEnv is all possible task env variables, including nomad-injected ones
+	FullEnv map[string]string
+
 	// taskEnv is the variables that will be set in the tasks environment
 	TaskEnv map[string]string
 
@@ -107,7 +110,7 @@ func NewTaskEnvironment(node *structs.Node, excludeNomadEnv bool) *TaskEnvironme
 func (t *TaskEnvironment) ParseAndReplace(args []string) []string {
 	replaced := make([]string, len(args))
 	for i, arg := range args {
-		replaced[i] = hargs.ReplaceEnv(arg, t.TaskEnv, t.NodeValues)
+		replaced[i] = hargs.ReplaceEnv(arg, t.FullEnv, t.NodeValues)
 	}
 
 	return replaced
@@ -117,18 +120,18 @@ func (t *TaskEnvironment) ParseAndReplace(args []string) []string {
 // and nomad variables.  If the variable is found in the passed map it is
 // replaced, otherwise the original string is returned.
 func (t *TaskEnvironment) ReplaceEnv(arg string) string {
-	return hargs.ReplaceEnv(arg, t.TaskEnv, t.NodeValues)
+	return hargs.ReplaceEnv(arg, t.FullEnv, t.NodeValues)
 }
 
 // Build must be called after all the tasks environment values have been set.
 func (t *TaskEnvironment) Build() *TaskEnvironment {
 	t.NodeValues = make(map[string]string)
-	fullEnv := make(map[string]string)
+	t.FullEnv = make(map[string]string)
 
 	// Build the meta with the following precedence: task, task group, job.
 	for _, meta := range []map[string]string{t.JobMeta, t.TaskGroupMeta, t.TaskMeta} {
 		for k, v := range meta {
-			fullEnv[fmt.Sprintf("%s%s", MetaPrefix, strings.ToUpper(k))] = v
+			t.FullEnv[fmt.Sprintf("%s%s", MetaPrefix, strings.ToUpper(k))] = v
 		}
 	}
 
@@ -136,45 +139,45 @@ func (t *TaskEnvironment) Build() *TaskEnvironment {
 	for _, network := range t.Networks {
 		for label, value := range network.MapLabelToValues(t.PortMap) {
 			IPPort := fmt.Sprintf("%s:%d", network.IP, value)
-			fullEnv[fmt.Sprintf("%s%s", AddrPrefix, label)] = IPPort
-			fullEnv[fmt.Sprintf("%s%s", IpPrefix, label)] = network.IP
-			fullEnv[fmt.Sprintf("%s%s", PortPrefix, label)] = fmt.Sprintf("%d", value)
+			t.FullEnv[fmt.Sprintf("%s%s", AddrPrefix, label)] = IPPort
+			t.FullEnv[fmt.Sprintf("%s%s", IpPrefix, label)] = network.IP
+			t.FullEnv[fmt.Sprintf("%s%s", PortPrefix, label)] = fmt.Sprintf("%d", value)
 
 			// Pass an explicit port mapping to the environment
 			if port, ok := t.PortMap[label]; ok {
-				fullEnv[fmt.Sprintf("%s%s", HostPortPrefix, label)] = strconv.Itoa(port)
+				t.FullEnv[fmt.Sprintf("%s%s", HostPortPrefix, label)] = strconv.Itoa(port)
 			}
 		}
 	}
 
 	// Build the directories
 	if t.AllocDir != "" {
-		fullEnv[AllocDir] = t.AllocDir
+		t.FullEnv[AllocDir] = t.AllocDir
 	}
 	if t.TaskDir != "" {
-		fullEnv[TaskLocalDir] = t.TaskDir
+		t.FullEnv[TaskLocalDir] = t.TaskDir
 	}
 
 	// Build the resource limits
 	if t.MemLimit != 0 {
-		fullEnv[MemLimit] = strconv.Itoa(t.MemLimit)
+		t.FullEnv[MemLimit] = strconv.Itoa(t.MemLimit)
 	}
 	if t.CpuLimit != 0 {
-		fullEnv[CpuLimit] = strconv.Itoa(t.CpuLimit)
+		t.FullEnv[CpuLimit] = strconv.Itoa(t.CpuLimit)
 	}
 
 	// Build the tasks ids
 	if t.AllocId != "" {
-		fullEnv[AllocID] = t.AllocId
+		t.FullEnv[AllocID] = t.AllocId
 	}
 	if t.AllocName != "" {
-		fullEnv[AllocName] = t.AllocName
+		t.FullEnv[AllocName] = t.AllocName
 	}
 	if t.AllocIndex != -1 {
-		fullEnv[AllocIndex] = strconv.Itoa(t.AllocIndex)
+		t.FullEnv[AllocIndex] = strconv.Itoa(t.AllocIndex)
 	}
 	if t.TaskName != "" {
-		fullEnv[TaskName] = t.TaskName
+		t.FullEnv[TaskName] = t.TaskName
 	}
 
 	// Build the node
@@ -199,17 +202,17 @@ func (t *TaskEnvironment) Build() *TaskEnvironment {
 	// Interpret the environment variables
 	interpreted := make(map[string]string, len(t.Env))
 	for k, v := range t.Env {
-		interpreted[k] = hargs.ReplaceEnv(v, t.NodeValues, t.TaskEnv)
+		interpreted[k] = hargs.ReplaceEnv(v, t.NodeValues, t.FullEnv)
 	}
 
 	for k, v := range interpreted {
-		fullEnv[k] = v
+		t.FullEnv[k] = v
 	}
 
 	if t.ExcludeNomadEnv {
 		t.TaskEnv = interpreted
 	} else {
-		t.TaskEnv = fullEnv
+		t.TaskEnv = t.FullEnv
 	}
 
 	return t

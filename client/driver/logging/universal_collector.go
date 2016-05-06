@@ -65,7 +65,6 @@ type SyslogCollector struct {
 	server     *SyslogServer
 	shuttler   *Shuttler
 	syslogChan chan *SyslogMessage
-	rawChan    chan []byte
 	taskDir    string
 
 	logger *log.Logger
@@ -76,7 +75,6 @@ func NewSyslogCollector(logger *log.Logger) *SyslogCollector {
 	return &SyslogCollector{
 		logger:     logger,
 		syslogChan: make(chan *SyslogMessage, 2048),
-		rawChan:    make(chan []byte, 2048),
 	}
 }
 
@@ -94,16 +92,22 @@ func (s *SyslogCollector) LaunchCollector(ctx *LogCollectorContext) (*SyslogColl
 		return nil, err
 	}
 
-	if s.logConfig.LogShuttleConfig != nil {
-		s.server = NewSyslogServer(l, s.rawChan, s.syslogChan, s.logger)
-		shuttler, err := NewShuttler(s.logConfig.LogShuttleConfig, s.logger)
+	if scfg := ctx.LogConfig.LogShuttleConfig; scfg != nil {
+		s.logger.Printf("[DEBUG] sylog-server: launching log shuttle")
+
+		// TODO: replace configurable vals from the task environment
+		// scfg.Procid = ctx.TaskEnv.ReplaceEnv(scfg.Procid)
+		//scfg.Appname = ctx.TaskEnv.ReplaceEnv(scfg.Appname)
+		//scfg.Hostname = ctx.TaskEnv.ReplaceEnv(scfg.Hostname)
+
+		shuttler, err := NewShuttler(scfg, s.logger)
 		if err != nil {
 			return nil, err
 		}
 		s.shuttler = shuttler
-	} else {
-		s.server = NewSyslogServer(l, nil, s.syslogChan, s.logger)
 	}
+	s.server = NewSyslogServer(l, s.syslogChan, s.logger)
+
 	go s.server.Start()
 	logFileSize := int64(ctx.LogConfig.MaxFileSizeMB * 1024 * 1024)
 
@@ -123,9 +127,6 @@ func (s *SyslogCollector) LaunchCollector(ctx *LogCollectorContext) (*SyslogColl
 	s.lre = lre
 
 	go s.collectLogs(lre, lro)
-	if s.shuttler != nil {
-		go s.shuttleLogs()
-	}
 	syslogAddr := fmt.Sprintf("%s://%s", l.Addr().Network(), l.Addr().String())
 	return &SyslogCollectorState{Addr: syslogAddr}, nil
 }
@@ -141,12 +142,10 @@ func (s *SyslogCollector) collectLogs(we io.Writer, wo io.Writer) {
 			s.lro.Write(logParts.Message)
 			s.lro.Write([]byte{'\n'})
 		}
-	}
-}
-
-func (s *SyslogCollector) shuttleLogs() {
-	for rawBytes := range s.rawChan {
-		s.shuttler.Write(rawBytes)
+		if s.shuttler != nil {
+			s.shuttler.Write(logParts.Message)
+			s.shuttler.Write([]byte{'\n'})
+		}
 	}
 }
 

@@ -16,6 +16,8 @@ type Shuttler struct {
 
 func NewShuttler(config *structs.LogShuttleConfig, logger *log.Logger) (*Shuttler, error) {
 	sConfig := getShuttleConfig(config)
+	sConfig.ComputeHeader()
+	logger.Printf("[DEBUG] log-shuttle config: %+v\n", sConfig)
 	s := shuttle.NewShuttle(sConfig)
 
 	pr, pw := io.Pipe()
@@ -41,20 +43,21 @@ func (s *Shuttler) Shutdown() {
 
 func getShuttleConfig(config *structs.LogShuttleConfig) shuttle.Config {
 	sConfig := shuttle.NewConfig()
+	sConfig.InputFormat = shuttle.InputFormatRaw
 	sConfig.UseGzip = config.UseGzip
 	sConfig.Drop = config.Drop
-	sConfig.Prival = config.Prival
-	sConfig.Version = config.Version
+	sConfig.Prival = shuttle.DefaultPriVal
+	sConfig.Version = shuttle.DefaultVersion
 	sConfig.Procid = config.Procid
 	sConfig.Appname = config.Appname
 	sConfig.Appname = config.LogplexToken
 	sConfig.Hostname = config.Hostname
-	sConfig.Msgid = config.Msgid
+	sConfig.Msgid = shuttle.DefaultMsgID
 	sConfig.LogsURL = config.LogsURL
 	sConfig.StatsSource = config.StatsSource
 	sConfig.StatsInterval = config.StatsInterval
-	sConfig.WaitDuration = config.WaitDuration
-	sConfig.Timeout = config.Timeout
+	sConfig.WaitDuration = shuttle.DefaultWaitDuration
+	sConfig.Timeout = shuttle.DefaultTimeout
 	sConfig.MaxAttempts = config.MaxAttempts
 	sConfig.NumOutlets = config.NumOutlets
 	sConfig.BatchSize = config.BatchSize
