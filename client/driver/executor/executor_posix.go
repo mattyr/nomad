@@ -28,7 +28,22 @@ func (e *UniversalExecutor) LaunchSyslogServer(ctx *ExecutorContext) (*SyslogSer
 		return nil, err
 	}
 
-	e.syslogServer = logging.NewSyslogServer(l, nil, e.syslogChan, e.logger)
+	if scfg := ctx.Task.LogConfig.LogShuttleConfig; scfg != nil {
+		e.logger.Printf("[DEBUG] sylog-server: launching log shuttle")
+
+		// replace configurable vals from the task environment
+		scfg.Procid = ctx.TaskEnv.ReplaceEnv(scfg.Procid)
+		scfg.Appname = ctx.TaskEnv.ReplaceEnv(scfg.Appname)
+		scfg.Hostname = ctx.TaskEnv.ReplaceEnv(scfg.Hostname)
+
+		shuttler, err := logging.NewShuttler(scfg, e.logger)
+		if err != nil {
+			return nil, err
+		}
+		e.shuttler = shuttler
+	}
+	e.syslogServer = logging.NewSyslogServer(l, e.syslogChan, e.logger)
+
 	go e.syslogServer.Start()
 	go e.collectLogs(e.lre, e.lro)
 	syslogAddr := fmt.Sprintf("%s://%s", l.Addr().Network(), l.Addr().String())
@@ -45,6 +60,10 @@ func (e *UniversalExecutor) collectLogs(we io.Writer, wo io.Writer) {
 		} else {
 			e.lro.Write(logParts.Message)
 			e.lro.Write([]byte{'\n'})
+		}
+		if e.shuttler != nil {
+			e.shuttler.Write(logParts.Message)
+			e.shuttler.Write([]byte{'\n'})
 		}
 	}
 }

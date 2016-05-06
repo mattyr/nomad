@@ -86,7 +86,6 @@ type LogConfig struct {
 type LogShuttleConfig struct {
 	UseGzip       bool
 	Drop          bool
-	SkipHeaders   bool
 	LogToSyslog   bool
 	Prival        string
 	Version       string

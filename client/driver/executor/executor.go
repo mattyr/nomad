@@ -155,6 +155,8 @@ type UniversalExecutor struct {
 
 	syslogServer *logging.SyslogServer
 	syslogChan   chan *logging.SyslogMessage
+	shuttler     *logging.Shuttler
+	rawChan      chan []byte
 
 	groups  *cgroupConfig.Cgroup
 	cgPaths map[string]string
@@ -364,6 +366,9 @@ func (e *UniversalExecutor) Exit() error {
 	}
 	e.lre.Close()
 	e.lro.Close()
+	if e.shuttler != nil {
+		e.shuttler.Shutdown()
+	}
 
 	// If the executor did not launch a process, return.
 	if e.command == nil {
