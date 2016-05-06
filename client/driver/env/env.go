@@ -73,21 +73,22 @@ const (
 // TaskEnvironment is used to expose information to a task via environment
 // variables and provide interpolation of Nomad variables.
 type TaskEnvironment struct {
-	Env           map[string]string
-	TaskMeta      map[string]string
-	TaskGroupMeta map[string]string
-	JobMeta       map[string]string
-	AllocDir      string
-	TaskDir       string
-	CpuLimit      int
-	MemLimit      int
-	TaskName      string
-	AllocIndex    int
-	AllocId       string
-	AllocName     string
-	Node          *structs.Node
-	Networks      []*structs.NetworkResource
-	PortMap       map[string]int
+	ExcludeNomadEnv bool
+	Env             map[string]string
+	TaskMeta        map[string]string
+	TaskGroupMeta   map[string]string
+	JobMeta         map[string]string
+	AllocDir        string
+	TaskDir         string
+	CpuLimit        int
+	MemLimit        int
+	TaskName        string
+	AllocIndex      int
+	AllocId         string
+	AllocName       string
+	Node            *structs.Node
+	Networks        []*structs.NetworkResource
+	PortMap         map[string]int
 
 	// taskEnv is the variables that will be set in the tasks environment
 	TaskEnv map[string]string
@@ -97,8 +98,8 @@ type TaskEnvironment struct {
 	NodeValues map[string]string
 }
 
-func NewTaskEnvironment(node *structs.Node) *TaskEnvironment {
-	return &TaskEnvironment{Node: node, AllocIndex: -1}
+func NewTaskEnvironment(node *structs.Node, excludeNomadEnv bool) *TaskEnvironment {
+	return &TaskEnvironment{Node: node, ExcludeNomadEnv: excludeNomadEnv, AllocIndex: -1}
 }
 
 // ParseAndReplace takes the user supplied args replaces any instance of an
@@ -122,12 +123,12 @@ func (t *TaskEnvironment) ReplaceEnv(arg string) string {
 // Build must be called after all the tasks environment values have been set.
 func (t *TaskEnvironment) Build() *TaskEnvironment {
 	t.NodeValues = make(map[string]string)
-	t.TaskEnv = make(map[string]string)
+	fullEnv := make(map[string]string)
 
 	// Build the meta with the following precedence: task, task group, job.
 	for _, meta := range []map[string]string{t.JobMeta, t.TaskGroupMeta, t.TaskMeta} {
 		for k, v := range meta {
-			t.TaskEnv[fmt.Sprintf("%s%s", MetaPrefix, strings.ToUpper(k))] = v
+			fullEnv[fmt.Sprintf("%s%s", MetaPrefix, strings.ToUpper(k))] = v
 		}
 	}
 
@@ -135,45 +136,45 @@ func (t *TaskEnvironment) Build() *TaskEnvironment {
 	for _, network := range t.Networks {
 		for label, value := range network.MapLabelToValues(t.PortMap) {
 			IPPort := fmt.Sprintf("%s:%d", network.IP, value)
-			t.TaskEnv[fmt.Sprintf("%s%s", AddrPrefix, label)] = IPPort
-			t.TaskEnv[fmt.Sprintf("%s%s", IpPrefix, label)] = network.IP
-			t.TaskEnv[fmt.Sprintf("%s%s", PortPrefix, label)] = fmt.Sprintf("%d", value)
+			fullEnv[fmt.Sprintf("%s%s", AddrPrefix, label)] = IPPort
+			fullEnv[fmt.Sprintf("%s%s", IpPrefix, label)] = network.IP
+			fullEnv[fmt.Sprintf("%s%s", PortPrefix, label)] = fmt.Sprintf("%d", value)
 
 			// Pass an explicit port mapping to the environment
 			if port, ok := t.PortMap[label]; ok {
-				t.TaskEnv[fmt.Sprintf("%s%s", HostPortPrefix, label)] = strconv.Itoa(port)
+				fullEnv[fmt.Sprintf("%s%s", HostPortPrefix, label)] = strconv.Itoa(port)
 			}
 		}
 	}
 
 	// Build the directories
 	if t.AllocDir != "" {
-		t.TaskEnv[AllocDir] = t.AllocDir
+		fullEnv[AllocDir] = t.AllocDir
 	}
 	if t.TaskDir != "" {
-		t.TaskEnv[TaskLocalDir] = t.TaskDir
+		fullEnv[TaskLocalDir] = t.TaskDir
 	}
 
 	// Build the resource limits
 	if t.MemLimit != 0 {
-		t.TaskEnv[MemLimit] = strconv.Itoa(t.MemLimit)
+		fullEnv[MemLimit] = strconv.Itoa(t.MemLimit)
 	}
 	if t.CpuLimit != 0 {
-		t.TaskEnv[CpuLimit] = strconv.Itoa(t.CpuLimit)
+		fullEnv[CpuLimit] = strconv.Itoa(t.CpuLimit)
 	}
 
 	// Build the tasks ids
 	if t.AllocId != "" {
-		t.TaskEnv[AllocID] = t.AllocId
+		fullEnv[AllocID] = t.AllocId
 	}
 	if t.AllocName != "" {
-		t.TaskEnv[AllocName] = t.AllocName
+		fullEnv[AllocName] = t.AllocName
 	}
 	if t.AllocIndex != -1 {
-		t.TaskEnv[AllocIndex] = strconv.Itoa(t.AllocIndex)
+		fullEnv[AllocIndex] = strconv.Itoa(t.AllocIndex)
 	}
 	if t.TaskName != "" {
-		t.TaskEnv[TaskName] = t.TaskName
+		fullEnv[TaskName] = t.TaskName
 	}
 
 	// Build the node
@@ -202,7 +203,13 @@ func (t *TaskEnvironment) Build() *TaskEnvironment {
 	}
 
 	for k, v := range interpreted {
-		t.TaskEnv[k] = v
+		fullEnv[k] = v
+	}
+
+	if t.ExcludeNomadEnv {
+		t.TaskEnv = interpreted
+	} else {
+		t.TaskEnv = fullEnv
 	}
 
 	return t

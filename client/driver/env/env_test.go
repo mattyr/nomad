@@ -57,7 +57,7 @@ func testTaskEnvironment() *TaskEnvironment {
 		envOneKey: envOneVal,
 		envTwoKey: envTwoVal,
 	}
-	return NewTaskEnvironment(n).SetEnvvars(envVars).Build()
+	return NewTaskEnvironment(n, false).SetEnvvars(envVars).Build()
 }
 
 func TestEnvironment_ParseAndReplace_Env(t *testing.T) {
@@ -137,7 +137,7 @@ func TestEnvironment_ReplaceEnv_Mixed(t *testing.T) {
 
 func TestEnvironment_AsList(t *testing.T) {
 	n := mock.Node()
-	env := NewTaskEnvironment(n).
+	env := NewTaskEnvironment(n, false).
 		SetNetworks(networks).
 		SetPortMap(portMap).
 		SetTaskGroupMeta(map[string]string{"foo": "bar", "baz": "bam"}).
@@ -164,7 +164,7 @@ func TestEnvironment_AsList(t *testing.T) {
 
 func TestEnvironment_ClearEnvvars(t *testing.T) {
 	n := mock.Node()
-	env := NewTaskEnvironment(n).
+	env := NewTaskEnvironment(n, false).
 		SetNetworks(networks).
 		SetPortMap(portMap).
 		SetEnvvars(map[string]string{"foo": "baz", "bar": "bang"}).Build()
@@ -242,7 +242,7 @@ func TestEnvironment_AppendHostEnvVars(t *testing.T) {
 
 func TestEnvironment_MetaPrecedence(t *testing.T) {
 	n := mock.Node()
-	env := NewTaskEnvironment(n).
+	env := NewTaskEnvironment(n, false).
 		SetJobMeta(map[string]string{"foo": "job", "bar": "job", "baz": "job"}).
 		SetTaskGroupMeta(map[string]string{"foo": "tg", "bar": "tg"}).
 		SetTaskMeta(map[string]string{"foo": "task"}).Build()

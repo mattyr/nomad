@@ -47,7 +47,7 @@ func mockAllocDir(t *testing.T) (*structs.Task, *allocdir.AllocDir) {
 }
 
 func testExecutorContext(t *testing.T) *ExecutorContext {
-	taskEnv := env.NewTaskEnvironment(mock.Node())
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false)
 	task, allocDir := mockAllocDir(t)
 	ctx := &ExecutorContext{
 		TaskEnv:  taskEnv,

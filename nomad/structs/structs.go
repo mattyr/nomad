@@ -1633,6 +1633,9 @@ type Task struct {
 	// Map of environment variables to be used by the driver
 	Env map[string]string
 
+	// Only use explicitly set Env variables in task environment
+	ExcludeNomadEnv bool
+
 	// List of service definitions exposed by the Task
 	Services []*Service
 
