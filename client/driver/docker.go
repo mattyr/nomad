@@ -80,6 +80,9 @@ type DockerDriverConfig struct {
 	SSL              bool                `mapstructure:"ssl"`                // Flag indicating repository is served via https
 	TTY              bool                `mapstructure:"tty"`                // Allocate a Pseudo-TTY
 	Interactive      bool                `mapstructure:"interactive"`        // Keep STDIN open even if not attached
+	AttachStdin      bool                `mapstructure:"attach_stdin"`       // Attach to STDIN
+	AttachStdout     bool                `mapstructure:"attach_stdout"`      // Attach to STDOUT
+	AttachStderr     bool                `mapstructure:"attach_stderr"`      // Attach to STDERR
 }
 
 func (c *DockerDriverConfig) Init() error {
@@ -188,6 +191,15 @@ func (d *DockerDriver) Validate(config map[string]interface{}) error {
 				Type: fields.TypeBool,
 			},
 			"interactive": &fields.FieldSchema{
+				Type: fields.TypeBool,
+			},
+			"attach_stdin": &fields.FieldSchema{
+				Type: fields.TypeBool,
+			},
+			"attach_stdout": &fields.FieldSchema{
+				Type: fields.TypeBool,
+			},
+			"attach_stderr": &fields.FieldSchema{
 				Type: fields.TypeBool,
 			},
 		},
@@ -312,11 +324,19 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 	d.taskEnv.SetTaskLocalDir(filepath.Join("/", allocdir.TaskLocal))
 
 	config := &docker.Config{
-		Image:     driverConfig.ImageName,
-		Hostname:  driverConfig.Hostname,
-		User:      task.User,
-		Tty:       driverConfig.TTY,
-		OpenStdin: driverConfig.Interactive,
+		Image:        driverConfig.ImageName,
+		Hostname:     driverConfig.Hostname,
+		User:         task.User,
+		Tty:          driverConfig.TTY,
+		OpenStdin:    driverConfig.Interactive,
+		AttachStdin:  driverConfig.AttachStdin,
+		AttachStdout: driverConfig.AttachStdout,
+		AttachStderr: driverConfig.AttachStderr,
+	}
+
+	// When allocating stdin in attached mode, close stdin at client disconnect
+	if config.OpenStdin && config.AttachStdin {
+		config.StdinOnce = true
 	}
 
 	hostConfig := &docker.HostConfig{
