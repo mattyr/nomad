@@ -10,6 +10,13 @@ import (
 	"github.com/hashicorp/nomad/client/driver"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/watch"
+	"github.com/hashicorp/nomad/scheduler"
+)
+
+const (
+	// RegisterEnforceIndexErrPrefix is the prefix to use in errors caused by
+	// enforcing the job modify index during registers.
+	RegisterEnforceIndexErrPrefix = "Enforcing job modify index"
 )
 
 // Job endpoint is used for job interactions
@@ -32,37 +39,32 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 	// Initialize the job fields (sets defaults and any necessary init work).
 	args.Job.InitFields()
 
-	if err := args.Job.Validate(); err != nil {
+	// Validate the job.
+	if err := validateJob(args.Job); err != nil {
 		return err
 	}
 
-	// Validate the driver configurations.
-	var driverErrors multierror.Error
-	for _, tg := range args.Job.TaskGroups {
-		for _, task := range tg.Tasks {
-			d, err := driver.NewDriver(
-				task.Driver,
-				driver.NewEmptyDriverContext(),
-			)
-			if err != nil {
-				msg := "failed to create driver for task %q in group %q for validation: %v"
-				driverErrors.Errors = append(driverErrors.Errors, fmt.Errorf(msg, tg.Name, task.Name, err))
-				continue
-			}
-
-			if err := d.Validate(task.Config); err != nil {
-				formatted := fmt.Errorf("group %q -> task %q -> config: %v", tg.Name, task.Name, err)
-				driverErrors.Errors = append(driverErrors.Errors, formatted)
-			}
+	if args.EnforceIndex {
+		// Lookup the job
+		snap, err := j.srv.fsm.State().Snapshot()
+		if err != nil {
+			return err
 		}
-	}
-
-	if len(driverErrors.Errors) != 0 {
-		return driverErrors.ErrorOrNil()
-	}
-
-	if args.Job.Type == structs.JobTypeCore {
-		return fmt.Errorf("job type cannot be core")
+		job, err := snap.JobByID(args.Job.ID)
+		if err != nil {
+			return err
+		}
+		jmi := args.JobModifyIndex
+		if job != nil {
+			if jmi == 0 {
+				return fmt.Errorf("%s 0: job already exists", RegisterEnforceIndexErrPrefix)
+			} else if jmi != job.JobModifyIndex {
+				return fmt.Errorf("%s %d: job exists with conflicting job modify index: %d",
+					RegisterEnforceIndexErrPrefix, jmi, job.JobModifyIndex)
+			}
+		} else if jmi != 0 {
+			return fmt.Errorf("%s %d: job does not exist", RegisterEnforceIndexErrPrefix, jmi)
+		}
 	}
 
 	// Commit this update via Raft
@@ -413,4 +415,147 @@ func (j *Job) Evaluations(args *structs.JobSpecificRequest,
 	// Set the query response
 	j.srv.setQueryMeta(&reply.QueryMeta)
 	return nil
+}
+
+// Plan is used to cause a dry-run evaluation of the Job and return the results
+// with a potential diff containing annotations.
+func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse) error {
+	if done, err := j.srv.forward("Job.Plan", args, args, reply); done {
+		return err
+	}
+	defer metrics.MeasureSince([]string{"nomad", "job", "plan"}, time.Now())
+
+	// Validate the arguments
+	if args.Job == nil {
+		return fmt.Errorf("Job required for plan")
+	}
+
+	// Initialize the job fields (sets defaults and any necessary init work).
+	args.Job.InitFields()
+
+	// Validate the job.
+	if err := validateJob(args.Job); err != nil {
+		return err
+	}
+
+	// Acquire a snapshot of the state
+	snap, err := j.srv.fsm.State().Snapshot()
+	if err != nil {
+		return err
+	}
+
+	// Get the original job
+	oldJob, err := snap.JobByID(args.Job.ID)
+	if err != nil {
+		return err
+	}
+
+	var index uint64
+	var updatedIndex uint64
+	if oldJob != nil {
+		index = oldJob.JobModifyIndex
+		updatedIndex = oldJob.JobModifyIndex + 1
+	}
+
+	// Insert the updated Job into the snapshot
+	snap.UpsertJob(updatedIndex, args.Job)
+
+	// Create an eval and mark it as requiring annotations and insert that as well
+	eval := &structs.Evaluation{
+		ID:             structs.GenerateUUID(),
+		Priority:       args.Job.Priority,
+		Type:           args.Job.Type,
+		TriggeredBy:    structs.EvalTriggerJobRegister,
+		JobID:          args.Job.ID,
+		JobModifyIndex: updatedIndex,
+		Status:         structs.EvalStatusPending,
+		AnnotatePlan:   true,
+	}
+
+	// Create an in-memory Planner that returns no errors and stores the
+	// submitted plan and created evals.
+	planner := &scheduler.Harness{
+		State: &snap.StateStore,
+	}
+
+	// Create the scheduler and run it
+	sched, err := scheduler.NewScheduler(eval.Type, j.srv.logger, snap, planner)
+	if err != nil {
+		return err
+	}
+
+	if err := sched.Process(eval); err != nil {
+		return err
+	}
+
+	// Annotate and store the diff
+	if plans := len(planner.Plans); plans != 1 {
+		return fmt.Errorf("scheduler resulted in an unexpected number of plans: %v", plans)
+	}
+	annotations := planner.Plans[0].Annotations
+	if args.Diff {
+		jobDiff, err := oldJob.Diff(args.Job, true)
+		if err != nil {
+			return fmt.Errorf("failed to create job diff: %v", err)
+		}
+
+		if err := scheduler.Annotate(jobDiff, annotations); err != nil {
+			return fmt.Errorf("failed to annotate job diff: %v", err)
+		}
+		reply.Diff = jobDiff
+	}
+
+	// Grab the failures
+	if len(planner.Evals) != 1 {
+		return fmt.Errorf("scheduler resulted in an unexpected number of eval updates: %v", planner.Evals)
+	}
+	updatedEval := planner.Evals[0]
+
+	// If it is a periodic job calculate the next launch
+	if args.Job.IsPeriodic() && args.Job.Periodic.Enabled {
+		reply.NextPeriodicLaunch = args.Job.Periodic.Next(time.Now().UTC())
+	}
+
+	reply.FailedTGAllocs = updatedEval.FailedTGAllocs
+	reply.JobModifyIndex = index
+	reply.Annotations = annotations
+	reply.CreatedEvals = planner.CreateEvals
+	reply.Index = index
+	return nil
+}
+
+// validateJob validates a Job and task drivers and returns an error if there is
+// a validation problem or if the Job is of a type a user is not allowed to
+// submit.
+func validateJob(job *structs.Job) error {
+	validationErrors := new(multierror.Error)
+	if err := job.Validate(); err != nil {
+		multierror.Append(validationErrors, err)
+	}
+
+	// Validate the driver configurations.
+	for _, tg := range job.TaskGroups {
+		for _, task := range tg.Tasks {
+			d, err := driver.NewDriver(
+				task.Driver,
+				driver.NewEmptyDriverContext(),
+			)
+			if err != nil {
+				msg := "failed to create driver for task %q in group %q for validation: %v"
+				multierror.Append(validationErrors, fmt.Errorf(msg, tg.Name, task.Name, err))
+				continue
+			}
+
+			if err := d.Validate(task.Config); err != nil {
+				formatted := fmt.Errorf("group %q -> task %q -> config: %v", tg.Name, task.Name, err)
+				multierror.Append(validationErrors, formatted)
+			}
+		}
+	}
+
+	if job.Type == structs.JobTypeCore {
+		multierror.Append(validationErrors, fmt.Errorf("job type cannot be core"))
+	}
+
+	return validationErrors.ErrorOrNil()
 }

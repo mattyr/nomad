@@ -50,6 +50,74 @@ func TestJobs_Register(t *testing.T) {
 	}
 }
 
+func TestJobs_EnforceRegister(t *testing.T) {
+	c, s := makeClient(t, nil, nil)
+	defer s.Stop()
+	jobs := c.Jobs()
+
+	// Listing jobs before registering returns nothing
+	resp, qm, err := jobs.List(nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if qm.LastIndex != 0 {
+		t.Fatalf("bad index: %d", qm.LastIndex)
+	}
+	if n := len(resp); n != 0 {
+		t.Fatalf("expected 0 jobs, got: %d", n)
+	}
+
+	// Create a job and attempt to register it with an incorrect index.
+	job := testJob()
+	eval, wm, err := jobs.EnforceRegister(job, 10, nil)
+	if err == nil || !strings.Contains(err.Error(), RegisterEnforceIndexErrPrefix) {
+		t.Fatalf("expected enforcement error: %v", err)
+	}
+
+	// Register
+	eval, wm, err = jobs.EnforceRegister(job, 0, nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if eval == "" {
+		t.Fatalf("missing eval id")
+	}
+	assertWriteMeta(t, wm)
+
+	// Query the jobs back out again
+	resp, qm, err = jobs.List(nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	assertQueryMeta(t, qm)
+
+	// Check that we got the expected response
+	if len(resp) != 1 {
+		t.Fatalf("bad length: %d", len(resp))
+	}
+
+	if resp[0].ID != job.ID {
+		t.Fatalf("bad: %#v", resp[0])
+	}
+	curIndex := resp[0].JobModifyIndex
+
+	// Fail at incorrect index
+	eval, wm, err = jobs.EnforceRegister(job, 123456, nil)
+	if err == nil || !strings.Contains(err.Error(), RegisterEnforceIndexErrPrefix) {
+		t.Fatalf("expected enforcement error: %v", err)
+	}
+
+	// Works at correct index
+	eval, wm, err = jobs.EnforceRegister(job, curIndex, nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if eval == "" {
+		t.Fatalf("missing eval id")
+	}
+	assertWriteMeta(t, wm)
+}
+
 func TestJobs_Info(t *testing.T) {
 	c, s := makeClient(t, nil, nil)
 	defer s.Stop()
@@ -348,6 +416,76 @@ func TestJobs_PeriodicForce(t *testing.T) {
 		return
 	}
 	t.Fatalf("evaluation %q missing", evalID)
+}
+
+func TestJobs_Plan(t *testing.T) {
+	c, s := makeClient(t, nil, nil)
+	defer s.Stop()
+	jobs := c.Jobs()
+
+	// Create a job and attempt to register it
+	job := testJob()
+	eval, wm, err := jobs.Register(job, nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if eval == "" {
+		t.Fatalf("missing eval id")
+	}
+	assertWriteMeta(t, wm)
+
+	// Check that passing a nil job fails
+	if _, _, err := jobs.Plan(nil, true, nil); err == nil {
+		t.Fatalf("expect an error when job isn't provided")
+	}
+
+	// Make a plan request
+	planResp, wm, err := jobs.Plan(job, true, nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if planResp == nil {
+		t.Fatalf("nil response")
+	}
+
+	if planResp.JobModifyIndex == 0 {
+		t.Fatalf("bad JobModifyIndex value: %#v", planResp)
+	}
+	if planResp.Diff == nil {
+		t.Fatalf("got nil diff: %#v", planResp)
+	}
+	if planResp.Annotations == nil {
+		t.Fatalf("got nil annotations: %#v", planResp)
+	}
+	// Can make this assertion because there are no clients.
+	if len(planResp.CreatedEvals) == 0 {
+		t.Fatalf("got no CreatedEvals: %#v", planResp)
+	}
+
+	// Make a plan request w/o the diff
+	planResp, wm, err = jobs.Plan(job, false, nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	assertWriteMeta(t, wm)
+
+	if planResp == nil {
+		t.Fatalf("nil response")
+	}
+
+	if planResp.JobModifyIndex == 0 {
+		t.Fatalf("bad JobModifyIndex value: %d", planResp.JobModifyIndex)
+	}
+	if planResp.Diff != nil {
+		t.Fatalf("got non-nil diff: %#v", planResp)
+	}
+	if planResp.Annotations == nil {
+		t.Fatalf("got nil annotations: %#v", planResp)
+	}
+	// Can make this assertion because there are no clients.
+	if len(planResp.CreatedEvals) == 0 {
+		t.Fatalf("got no CreatedEvals: %#v", planResp)
+	}
 }
 
 func TestJobs_NewBatchJob(t *testing.T) {

@@ -4,6 +4,50 @@ import (
 	"time"
 )
 
+// MemoryStats holds memory usage related stats
+type MemoryStats struct {
+	RSS            uint64
+	Cache          uint64
+	Swap           uint64
+	MaxUsage       uint64
+	KernelUsage    uint64
+	KernelMaxUsage uint64
+	Measured       []string
+}
+
+// CpuStats holds cpu usage related stats
+type CpuStats struct {
+	SystemMode       float64
+	UserMode         float64
+	TotalTicks       float64
+	ThrottledPeriods uint64
+	ThrottledTime    uint64
+	Percent          float64
+	Measured         []string
+}
+
+// ResourceUsage holds information related to cpu and memory stats
+type ResourceUsage struct {
+	MemoryStats *MemoryStats
+	CpuStats    *CpuStats
+}
+
+// TaskResourceUsage holds aggregated resource usage of all processes in a Task
+// and the resource usage of the individual pids
+type TaskResourceUsage struct {
+	ResourceUsage *ResourceUsage
+	Timestamp     int64
+	Pids          map[string]*ResourceUsage
+}
+
+// AllocResourceUsage holds the aggregated task resource usage of the
+// allocation.
+type AllocResourceUsage struct {
+	ResourceUsage *ResourceUsage
+	Tasks         map[string]*TaskResourceUsage
+	Timestamp     int64
+}
+
 // RestartPolicy defines how the Nomad client restarts
 // tasks in a taskgroup when they fail
 type RestartPolicy struct {
@@ -27,7 +71,7 @@ type ServiceCheck struct {
 	Timeout  time.Duration
 }
 
-// The Service model represents a Consul service defintion
+// The Service model represents a Consul service definition
 type Service struct {
 	Id        string
 	Name      string
@@ -177,7 +221,7 @@ func (t *Task) SetLogConfig(l *LogConfig) *Task {
 }
 
 // TaskState tracks the current state of a task and events that caused state
-// transistions.
+// transitions.
 type TaskState struct {
 	State  string
 	Events []*TaskEvent

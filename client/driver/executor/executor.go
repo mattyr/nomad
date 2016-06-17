@@ -9,20 +9,40 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/mitchellh/go-ps"
 	cgroupConfig "github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/shirou/gopsutil/process"
 
 	"github.com/hashicorp/nomad/client/allocdir"
-	"github.com/hashicorp/nomad/client/consul"
 	"github.com/hashicorp/nomad/client/driver/env"
 	"github.com/hashicorp/nomad/client/driver/logging"
-	cstructs "github.com/hashicorp/nomad/client/driver/structs"
+	"github.com/hashicorp/nomad/client/stats"
+	"github.com/hashicorp/nomad/command/agent/consul"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/nomad/structs/config"
+
+	dstructs "github.com/hashicorp/nomad/client/driver/structs"
+	cstructs "github.com/hashicorp/nomad/client/structs"
+)
+
+const (
+	// pidScanInterval is the interval at which the executor scans the process
+	// tree for finding out the pids that the executor and it's child processes
+	// have forked
+	pidScanInterval = 5 * time.Second
+)
+
+var (
+	// The statistics the basic executor exposes
+	ExecutorBasicMeasuredMemStats = []string{"RSS", "Swap"}
+	ExecutorBasicMeasuredCpuStats = []string{"System Mode", "User Mode", "Percent"}
 )
 
 // Executor is the interface which allows a driver to launch and supervise
@@ -38,12 +58,14 @@ type Executor interface {
 	SyncServices(ctx *ConsulContext) error
 	DeregisterServices() error
 	Version() (*ExecutorVersion, error)
+	Stats() (*cstructs.TaskResourceUsage, error)
 }
 
-// ConsulContext holds context to configure the consul client and run checks
+// ConsulContext holds context to configure the Consul client and run checks
 type ConsulContext struct {
-	// ConsulConfig is the configuration used to create a consul client
-	ConsulConfig *consul.ConsulConfig
+	// ConsulConfig contains the configuration information for talking
+	// with this Nomad Agent's Consul Agent.
+	ConsulConfig *config.ConsulConfig
 
 	// ContainerID is the ID of the container
 	ContainerID string
@@ -117,14 +139,22 @@ type ProcessState struct {
 	Pid             int
 	ExitCode        int
 	Signal          int
-	IsolationConfig *cstructs.IsolationConfig
+	IsolationConfig *dstructs.IsolationConfig
 	Time            time.Time
+}
+
+// nomadPid holds a pid and it's cpu percentage calculator
+type nomadPid struct {
+	pid           int
+	cpuStatsTotal *stats.CpuStats
+	cpuStatsUser  *stats.CpuStats
+	cpuStatsSys   *stats.CpuStats
 }
 
 // SyslogServerState holds the address and islation information of a launched
 // syslog server
 type SyslogServerState struct {
-	IsolationConfig *cstructs.IsolationConfig
+	IsolationConfig *dstructs.IsolationConfig
 	Addr            string
 }
 
@@ -145,13 +175,18 @@ type UniversalExecutor struct {
 	ctx     *ExecutorContext
 	command *ExecCommand
 
-	taskDir       string
-	exitState     *ProcessState
-	processExited chan interface{}
+	pids                map[int]*nomadPid
+	pidLock             sync.RWMutex
+	taskDir             string
+	exitState           *ProcessState
+	processExited       chan interface{}
+	fsIsolationEnforced bool
 
 	lre         *logging.FileRotator
 	lro         *logging.FileRotator
 	rotatorLock sync.Mutex
+
+	shutdownCh chan struct{}
 
 	syslogServer *logging.SyslogServer
 	syslogChan   chan *logging.SyslogMessage
@@ -162,17 +197,26 @@ type UniversalExecutor struct {
 	cgPaths map[string]string
 	cgLock  sync.Mutex
 
-	consulService *consul.ConsulService
-	consulCtx     *ConsulContext
-	logger        *log.Logger
+	consulSyncer   *consul.Syncer
+	consulCtx      *ConsulContext
+	totalCpuStats  *stats.CpuStats
+	userCpuStats   *stats.CpuStats
+	systemCpuStats *stats.CpuStats
+	logger         *log.Logger
 }
 
 // NewExecutor returns an Executor
 func NewExecutor(logger *log.Logger) Executor {
-	return &UniversalExecutor{
-		logger:        logger,
-		processExited: make(chan interface{}),
+	exec := &UniversalExecutor{
+		logger:         logger,
+		processExited:  make(chan interface{}),
+		totalCpuStats:  stats.NewCpuStats(),
+		userCpuStats:   stats.NewCpuStats(),
+		systemCpuStats: stats.NewCpuStats(),
+		pids:           make(map[int]*nomadPid),
 	}
+
+	return exec
 }
 
 // Version returns the api version of the executor
@@ -188,17 +232,6 @@ func (e *UniversalExecutor) LaunchCmd(command *ExecCommand, ctx *ExecutorContext
 	e.ctx = ctx
 	e.command = command
 
-	// configuring the task dir
-	if err := e.configureTaskDir(); err != nil {
-		return nil, err
-	}
-
-	// configuring the chroot, cgroup and enters the plugin process in the
-	// chroot
-	if err := e.configureIsolation(); err != nil {
-		return nil, err
-	}
-
 	// setting the user of the process
 	if command.User != "" {
 		e.logger.Printf("[DEBUG] executor: running command as %s", command.User)
@@ -207,14 +240,30 @@ func (e *UniversalExecutor) LaunchCmd(command *ExecCommand, ctx *ExecutorContext
 		}
 	}
 
+	// configuring the task dir
+	if err := e.configureTaskDir(); err != nil {
+		return nil, err
+	}
+
+	e.ctx.TaskEnv.Build()
+	// configuring the chroot, cgroup and enters the plugin process in the
+	// chroot
+	if err := e.configureIsolation(); err != nil {
+		return nil, err
+	}
+	// Apply ourselves into the cgroup. The executor MUST be in the cgroup
+	// before the user task is started, otherwise we are subject to a fork
+	// attack in which a process escapes isolation by immediately forking.
+	if err := e.applyLimits(os.Getpid()); err != nil {
+		return nil, err
+	}
+
 	// Setup the loggers
 	if err := e.configureLoggers(); err != nil {
 		return nil, err
 	}
 	e.cmd.Stdout = e.lro
 	e.cmd.Stderr = e.lre
-
-	e.ctx.TaskEnv.Build()
 
 	// Look up the binary path and make it executable
 	absPath, err := e.lookupBin(ctx.TaskEnv.ReplaceEnv(command.Cmd))
@@ -226,10 +275,11 @@ func (e *UniversalExecutor) LaunchCmd(command *ExecCommand, ctx *ExecutorContext
 		return nil, err
 	}
 
-	// Determine the path to run as it may have to be relative to the chroot.
 	path := absPath
-	if e.command.FSIsolation {
-		rel, err := filepath.Rel(e.taskDir, absPath)
+
+	// Determine the path to run as it may have to be relative to the chroot.
+	if e.fsIsolationEnforced {
+		rel, err := filepath.Rel(e.taskDir, path)
 		if err != nil {
 			return nil, err
 		}
@@ -238,22 +288,16 @@ func (e *UniversalExecutor) LaunchCmd(command *ExecCommand, ctx *ExecutorContext
 
 	// Set the commands arguments
 	e.cmd.Path = path
-	e.cmd.Args = append([]string{path}, ctx.TaskEnv.ParseAndReplace(command.Args)...)
+	e.cmd.Args = append([]string{e.cmd.Path}, ctx.TaskEnv.ParseAndReplace(command.Args)...)
 	e.cmd.Env = ctx.TaskEnv.EnvList()
-
-	// Apply ourselves into the cgroup. The executor MUST be in the cgroup
-	// before the user task is started, otherwise we are subject to a fork
-	// attack in which a process escapes isolation by immediately forking.
-	if err := e.applyLimits(os.Getpid()); err != nil {
-		return nil, err
-	}
 
 	// Start the process
 	if err := e.cmd.Start(); err != nil {
 		return nil, err
 	}
+	go e.collectPids()
 	go e.wait()
-	ic := &cstructs.IsolationConfig{Cgroup: e.groups, CgroupPaths: e.cgPaths}
+	ic := &dstructs.IsolationConfig{Cgroup: e.groups, CgroupPaths: e.cgPaths}
 	return &ProcessState{Pid: e.cmd.Process.Pid, ExitCode: -1, IsolationConfig: ic, Time: time.Now()}, nil
 }
 
@@ -317,19 +361,31 @@ func (e *UniversalExecutor) UpdateTask(task *structs.Task) error {
 	e.lre.MaxFiles = task.LogConfig.MaxFiles
 	e.lre.FileSize = fileSize
 
-	// Re-syncing task with consul service
-	if e.consulService != nil {
-		if err := e.consulService.SyncTask(task); err != nil {
-			return err
-		}
+	// Re-syncing task with Consul agent
+	if e.consulSyncer != nil {
+		e.interpolateServices(e.ctx.Task)
+		domain := consul.NewExecutorDomain(e.ctx.AllocID, task.Name)
+		serviceMap := generateServiceKeys(e.ctx.AllocID, task.Services)
+		e.consulSyncer.SetServices(domain, serviceMap)
 	}
 	return nil
+}
+
+// generateServiceKeys takes a list of interpolated Nomad Services and returns a map
+// of ServiceKeys to Nomad Services.
+func generateServiceKeys(allocID string, services []*structs.Service) map[consul.ServiceKey]*structs.Service {
+	keys := make(map[consul.ServiceKey]*structs.Service, len(services))
+	for _, service := range services {
+		key := consul.GenerateServiceKey(service)
+		keys[key] = service
+	}
+	return keys
 }
 
 func (e *UniversalExecutor) wait() {
 	defer close(e.processExited)
 	err := e.cmd.Wait()
-	ic := &cstructs.IsolationConfig{Cgroup: e.groups, CgroupPaths: e.cgPaths}
+	ic := &dstructs.IsolationConfig{Cgroup: e.groups, CgroupPaths: e.cgPaths}
 	if err == nil {
 		e.exitState = &ProcessState{Pid: 0, ExitCode: 0, IsolationConfig: ic, Time: time.Now()}
 		return
@@ -340,8 +396,16 @@ func (e *UniversalExecutor) wait() {
 		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 			exitCode = status.ExitStatus()
 			if status.Signaled() {
+				// bash(1) uses the lower 7 bits of a uint8
+				// to indicate normal program failure (see
+				// <sysexits.h>). If a process terminates due
+				// to a signal, encode the signal number to
+				// indicate which signal caused the process
+				// to terminate.  Mirror this exit code
+				// encoding scheme.
+				const exitSignalBase = 128
 				signal = int(status.Signal())
-				exitCode = 128 + signal
+				exitCode = exitSignalBase + signal
 			}
 		}
 	} else {
@@ -368,6 +432,10 @@ func (e *UniversalExecutor) Exit() error {
 	e.lro.Close()
 	if e.shuttler != nil {
 		e.shuttler.Shutdown()
+	}
+
+	if e.consulSyncer != nil {
+		e.consulSyncer.Shutdown()
 	}
 
 	// If the executor did not launch a process, return.
@@ -424,31 +492,73 @@ func (e *UniversalExecutor) ShutDown() error {
 	return nil
 }
 
+// SyncServices syncs the services of the task that the executor is running with
+// Consul
 func (e *UniversalExecutor) SyncServices(ctx *ConsulContext) error {
 	e.logger.Printf("[INFO] executor: registering services")
 	e.consulCtx = ctx
-	if e.consulService == nil {
-		cs, err := consul.NewConsulService(ctx.ConsulConfig, e.logger, e.ctx.AllocID)
+	if e.consulSyncer == nil {
+		cs, err := consul.NewSyncer(ctx.ConsulConfig, e.shutdownCh, e.logger)
 		if err != nil {
 			return err
 		}
-		cs.SetDelegatedChecks(e.createCheckMap(), e.createCheck)
-		e.consulService = cs
+		e.consulSyncer = cs
+		go e.consulSyncer.Run()
 	}
-	if e.ctx != nil {
-		e.interpolateServices(e.ctx.Task)
-	}
-	err := e.consulService.SyncTask(e.ctx.Task)
-	go e.consulService.PeriodicSync()
-	return err
+	e.interpolateServices(e.ctx.Task)
+	e.consulSyncer.SetDelegatedChecks(e.createCheckMap(), e.createCheck)
+	e.consulSyncer.SetAddrFinder(e.ctx.Task.FindHostAndPortFor)
+	domain := consul.NewExecutorDomain(e.ctx.AllocID, e.ctx.Task.Name)
+	serviceMap := generateServiceKeys(e.ctx.AllocID, e.ctx.Task.Services)
+	e.consulSyncer.SetServices(domain, serviceMap)
+	return nil
 }
 
+// DeregisterServices removes the services of the task that the executor is
+// running from Consul
 func (e *UniversalExecutor) DeregisterServices() error {
 	e.logger.Printf("[INFO] executor: de-registering services and shutting down consul service")
-	if e.consulService != nil {
-		return e.consulService.Shutdown()
+	if e.consulSyncer != nil {
+		return e.consulSyncer.Shutdown()
 	}
 	return nil
+}
+
+// pidStats returns the resource usage stats per pid
+func (e *UniversalExecutor) pidStats() (map[string]*cstructs.ResourceUsage, error) {
+	stats := make(map[string]*cstructs.ResourceUsage)
+	e.pidLock.RLock()
+	pids := make(map[int]*nomadPid, len(e.pids))
+	for k, v := range e.pids {
+		pids[k] = v
+	}
+	e.pidLock.RUnlock()
+	for pid, np := range pids {
+		p, err := process.NewProcess(int32(pid))
+		if err != nil {
+			e.logger.Printf("[DEBUG] executor: unable to create new process with pid: %v", pid)
+			continue
+		}
+		ms := &cstructs.MemoryStats{}
+		if memInfo, err := p.MemoryInfo(); err == nil {
+			ms.RSS = memInfo.RSS
+			ms.Swap = memInfo.Swap
+			ms.Measured = ExecutorBasicMeasuredMemStats
+		}
+
+		cs := &cstructs.CpuStats{}
+		if cpuStats, err := p.Times(); err == nil {
+			cs.SystemMode = np.cpuStatsSys.Percent(cpuStats.System * float64(time.Second))
+			cs.UserMode = np.cpuStatsUser.Percent(cpuStats.User * float64(time.Second))
+			cs.Measured = ExecutorBasicMeasuredCpuStats
+
+			// calculate cpu usage percent
+			cs.Percent = np.cpuStatsTotal.Percent(cpuStats.Total() * float64(time.Second))
+		}
+		stats[strconv.Itoa(pid)] = &cstructs.ResourceUsage{MemoryStats: ms, CpuStats: cs}
+	}
+
+	return stats, nil
 }
 
 // configureTaskDir sets the task dir in the executor
@@ -571,6 +681,7 @@ func (e *UniversalExecutor) createCheck(check *structs.ServiceCheck, checkID str
 		return &DockerScriptCheck{
 			id:          checkID,
 			interval:    check.Interval,
+			timeout:     check.Timeout,
 			containerID: e.consulCtx.ContainerID,
 			logger:      e.logger,
 			cmd:         check.Command,
@@ -578,10 +689,12 @@ func (e *UniversalExecutor) createCheck(check *structs.ServiceCheck, checkID str
 		}, nil
 	}
 
-	if check.Type == structs.ServiceCheckScript && e.ctx.Driver == "exec" {
+	if check.Type == structs.ServiceCheckScript && (e.ctx.Driver == "exec" ||
+		e.ctx.Driver == "raw_exec" || e.ctx.Driver == "java") {
 		return &ExecScriptCheck{
 			id:          checkID,
 			interval:    check.Interval,
+			timeout:     check.Timeout,
 			cmd:         check.Command,
 			args:        check.Args,
 			taskDir:     e.taskDir,
@@ -608,5 +721,129 @@ func (e *UniversalExecutor) interpolateServices(task *structs.Task) {
 		}
 		service.Name = e.ctx.TaskEnv.ReplaceEnv(service.Name)
 		service.Tags = e.ctx.TaskEnv.ParseAndReplace(service.Tags)
+	}
+}
+
+// collectPids collects the pids of the child processes that the executor is
+// running every 5 seconds
+func (e *UniversalExecutor) collectPids() {
+	// Fire the timer right away when the executor starts from there on the pids
+	// are collected every scan interval
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			pids, err := e.getAllPids()
+			if err != nil {
+				e.logger.Printf("[DEBUG] executor: error collecting pids: %v", err)
+			}
+			e.pidLock.Lock()
+
+			// Adding pids which are not being tracked
+			for pid, np := range pids {
+				if _, ok := e.pids[pid]; !ok {
+					e.pids[pid] = np
+				}
+			}
+			// Removing pids which are no longer present
+			for pid := range e.pids {
+				if _, ok := pids[pid]; !ok {
+					delete(e.pids, pid)
+				}
+			}
+			e.pidLock.Unlock()
+			timer.Reset(pidScanInterval)
+		case <-e.processExited:
+			return
+		}
+	}
+}
+
+// scanPids scans all the pids on the machine running the current executor and
+// returns the child processes of the executor.
+func (e *UniversalExecutor) scanPids(parentPid int, allPids []ps.Process) (map[int]*nomadPid, error) {
+	processFamily := make(map[int]struct{})
+	processFamily[parentPid] = struct{}{}
+
+	// A buffer for holding pids which haven't matched with any parent pid
+	var pidsRemaining []ps.Process
+	for {
+		// flag to indicate if we have found a match
+		foundNewPid := false
+
+		for _, pid := range allPids {
+			_, childPid := processFamily[pid.PPid()]
+
+			// checking if the pid is a child of any of the parents
+			if childPid {
+				processFamily[pid.Pid()] = struct{}{}
+				foundNewPid = true
+			} else {
+				// if it is not, then we add the pid to the buffer
+				pidsRemaining = append(pidsRemaining, pid)
+			}
+			// scan only the pids which are left in the buffer
+			allPids = pidsRemaining
+		}
+
+		// not scanning anymore if we couldn't find a single match
+		if !foundNewPid {
+			break
+		}
+	}
+	res := make(map[int]*nomadPid)
+	for pid := range processFamily {
+		np := nomadPid{
+			pid:           pid,
+			cpuStatsTotal: stats.NewCpuStats(),
+			cpuStatsUser:  stats.NewCpuStats(),
+			cpuStatsSys:   stats.NewCpuStats(),
+		}
+		res[pid] = &np
+	}
+	return res, nil
+}
+
+// aggregatedResourceUsage aggregates the resource usage of all the pids and
+// returns a TaskResourceUsage data point
+func (e *UniversalExecutor) aggregatedResourceUsage(pidStats map[string]*cstructs.ResourceUsage) *cstructs.TaskResourceUsage {
+	ts := time.Now().UTC().UnixNano()
+	var (
+		systemModeCPU, userModeCPU, percent float64
+		totalRSS, totalSwap                 uint64
+	)
+
+	for _, pidStat := range pidStats {
+		systemModeCPU += pidStat.CpuStats.SystemMode
+		userModeCPU += pidStat.CpuStats.UserMode
+		percent += pidStat.CpuStats.Percent
+
+		totalRSS += pidStat.MemoryStats.RSS
+		totalSwap += pidStat.MemoryStats.Swap
+	}
+
+	totalCPU := &cstructs.CpuStats{
+		SystemMode: systemModeCPU,
+		UserMode:   userModeCPU,
+		Percent:    percent,
+		Measured:   ExecutorBasicMeasuredCpuStats,
+		TotalTicks: e.systemCpuStats.TicksConsumed(percent),
+	}
+
+	totalMemory := &cstructs.MemoryStats{
+		RSS:      totalRSS,
+		Swap:     totalSwap,
+		Measured: ExecutorBasicMeasuredMemStats,
+	}
+
+	resourceUsage := cstructs.ResourceUsage{
+		MemoryStats: totalMemory,
+		CpuStats:    totalCPU,
+	}
+	return &cstructs.TaskResourceUsage{
+		ResourceUsage: &resourceUsage,
+		Timestamp:     ts,
+		Pids:          pidStats,
 	}
 }

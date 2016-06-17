@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,7 +12,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/NYTimes/gziphandler"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/ugorji/go/codec"
 )
 
 const (
@@ -23,6 +26,13 @@ const (
 	// this is checked to switch between the ACLToken and
 	// AtlasACLToken
 	scadaHTTPAddr = "SCADA"
+)
+
+var (
+	// jsonHandle and jsonHandlePretty are the codec handles to JSON encode
+	// structs. The pretty handle will add indents for easier human consumption.
+	jsonHandle       = &codec.JsonHandle{}
+	jsonHandlePretty = &codec.JsonHandle{Indent: 4}
 )
 
 // HTTPServer is used to wrap an Agent and expose it over an HTTP interface
@@ -56,7 +66,7 @@ func NewHTTPServer(agent *Agent, config *Config, logOutput io.Writer) (*HTTPServ
 	srv.registerHandlers(config.EnableDebug)
 
 	// Start the server
-	go http.Serve(ln, mux)
+	go http.Serve(ln, gziphandler.GzipHandler(mux))
 	return srv, nil
 }
 
@@ -77,7 +87,7 @@ func newScadaHttp(agent *Agent, list net.Listener) *HTTPServer {
 	srv.registerHandlers(false) // Never allow debug for SCADA
 
 	// Start the server
-	go http.Serve(list, mux)
+	go http.Serve(list, gziphandler.GzipHandler(mux))
 	return srv
 }
 
@@ -104,6 +114,8 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.HandleFunc("/v1/evaluation/", s.wrap(s.EvalSpecificRequest))
 
 	s.mux.HandleFunc("/v1/client/fs/", s.wrap(s.FsRequest))
+	s.mux.HandleFunc("/v1/client/stats", s.wrap(s.ClientStatsRequest))
+	s.mux.HandleFunc("/v1/client/allocation/", s.wrap(s.ClientAllocRequest))
 
 	s.mux.HandleFunc("/v1/agent/self", s.wrap(s.AgentSelfRequest))
 	s.mux.HandleFunc("/v1/agent/join", s.wrap(s.AgentJoinRequest))
@@ -175,23 +187,30 @@ func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Reque
 		}
 
 		prettyPrint := false
-		if _, ok := req.URL.Query()["pretty"]; ok {
-			prettyPrint = true
+		if v, ok := req.URL.Query()["pretty"]; ok {
+			if len(v) > 0 && (len(v[0]) == 0 || v[0] != "0") {
+				prettyPrint = true
+			}
 		}
 
 		// Write out the JSON object
 		if obj != nil {
-			var buf []byte
+			var buf bytes.Buffer
 			if prettyPrint {
-				buf, err = json.MarshalIndent(obj, "", "    ")
+				enc := codec.NewEncoder(&buf, jsonHandlePretty)
+				err = enc.Encode(obj)
+				if err == nil {
+					buf.Write([]byte("\n"))
+				}
 			} else {
-				buf, err = json.Marshal(obj)
+				enc := codec.NewEncoder(&buf, jsonHandle)
+				err = enc.Encode(obj)
 			}
 			if err != nil {
 				goto HAS_ERR
 			}
 			resp.Header().Set("Content-Type", "application/json")
-			resp.Write(buf)
+			resp.Write(buf.Bytes())
 		}
 	}
 	return f

@@ -9,12 +9,14 @@ import (
 
 	"github.com/hashicorp/nomad/api"
 	"github.com/mitchellh/cli"
+	"github.com/mitchellh/colorstring"
 )
 
 const (
 	// Names of environment variables used to supply various
 	// config options to the Nomad CLI.
 	EnvNomadAddress = "NOMAD_ADDR"
+	EnvNomadRegion  = "NOMAD_REGION"
 
 	// Constants for CLI identifier length
 	shortId = 8
@@ -38,6 +40,12 @@ type Meta struct {
 
 	// These are set by the command line flags.
 	flagAddress string
+
+	// Whether to not-colorize output
+	noColor bool
+
+	// The region to send API requests
+	region string
 }
 
 // FlagSet returns a FlagSet with the common flags that every
@@ -51,6 +59,8 @@ func (m *Meta) FlagSet(n string, fs FlagSetFlags) *flag.FlagSet {
 	// client connectivity options.
 	if fs&FlagSetClient != 0 {
 		f.StringVar(&m.flagAddress, "address", "", "")
+		f.StringVar(&m.region, "region", "", "")
+		f.BoolVar(&m.noColor, "no-color", false, "")
 	}
 
 	// Create an io.Writer that writes to our UI properly for errors.
@@ -79,7 +89,21 @@ func (m *Meta) Client() (*api.Client, error) {
 	if m.flagAddress != "" {
 		config.Address = m.flagAddress
 	}
+	if v := os.Getenv(EnvNomadRegion); v != "" {
+		config.Region = v
+	}
+	if m.region != "" {
+		config.Region = m.region
+	}
 	return api.NewClient(config)
+}
+
+func (m *Meta) Colorize() *colorstring.Colorize {
+	return &colorstring.Colorize{
+		Colors:  colorstring.DefaultColors,
+		Disable: m.noColor,
+		Reset:   true,
+	}
 }
 
 // generalOptionsUsage returns the help string for the global options.
@@ -89,6 +113,14 @@ func generalOptionsUsage() string {
     The address of the Nomad server.
     Overrides the NOMAD_ADDR environment variable if set.
     Default = http://127.0.0.1:4646
+
+  -region=<region>
+    The region of the Nomad servers to forward commands to.
+    Overrides the NOMAD_REGION environment variable if set.
+    Defaults to the Agent's local region.
+  
+  -no-color
+    Disables colored command output.
 `
 	return strings.TrimSpace(helpText)
 }

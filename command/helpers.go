@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/hashicorp/nomad/api"
@@ -45,7 +46,14 @@ func limit(s string, length int) string {
 
 // formatTime formats the time to string based on RFC822
 func formatTime(t time.Time) string {
-	return t.Format("02/01/06 15:04:05 MST")
+	return t.Format("01/02/06 15:04:05 MST")
+}
+
+// formatTimeDifference takes two times and determines their duration difference
+// truncating to a passed unit.
+// E.g. formatTimeDifference(first=1m22s33ms, second=1m28s55ms, time.Second) -> 6s
+func formatTimeDifference(first, second time.Time, d time.Duration) string {
+	return second.Truncate(d).Sub(first.Truncate(d)).String()
 }
 
 // getLocalNodeID returns the node ID of the local Nomad Client and an error if
@@ -68,4 +76,20 @@ func getLocalNodeID(client *api.Client) (string, error) {
 	}
 
 	return nodeID, nil
+}
+
+// evalFailureStatus returns whether the evaluation has failures and a string to
+// display when presenting users with whether there are failures for the eval
+func evalFailureStatus(eval *api.Evaluation) (string, bool) {
+	if eval == nil {
+		return "", false
+	}
+
+	hasFailures := len(eval.FailedTGAllocs) != 0
+	text := strconv.FormatBool(hasFailures)
+	if eval.Status == "blocked" {
+		text = "N/A - In Progress"
+	}
+
+	return text, hasFailures
 }

@@ -7,8 +7,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/armon/go-metrics"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/client/config"
@@ -17,7 +20,8 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 
 	"github.com/hashicorp/nomad/client/driver/env"
-	cstructs "github.com/hashicorp/nomad/client/driver/structs"
+	dstructs "github.com/hashicorp/nomad/client/driver/structs"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 )
 
 const (
@@ -43,9 +47,17 @@ type TaskRunner struct {
 	alloc          *structs.Allocation
 	restartTracker *RestartTracker
 
-	task       *structs.Task
-	taskEnv    *env.TaskEnvironment
-	updateCh   chan *structs.Allocation
+	// running marks whether the task is running
+	running     bool
+	runningLock sync.Mutex
+
+	resourceUsage     *cstructs.TaskResourceUsage
+	resourceUsageLock sync.RWMutex
+
+	task     *structs.Task
+	taskEnv  *env.TaskEnvironment
+	updateCh chan *structs.Allocation
+
 	handle     driver.DriverHandle
 	handleLock sync.Mutex
 
@@ -134,7 +146,13 @@ func (r *TaskRunner) RestoreState() error {
 	}
 
 	// Restore fields
-	r.task = snap.Task
+	if snap.Task == nil {
+		err := fmt.Errorf("task runner snapshot include nil Task")
+		r.logger.Printf("[ERR] client: %v", err)
+		return err
+	} else {
+		r.task = snap.Task
+	}
 	r.artifactsDownloaded = snap.ArtifactDownloaded
 
 	if err := r.setTaskEnv(); err != nil {
@@ -200,7 +218,7 @@ func (r *TaskRunner) setState(state string, event *structs.TaskEvent) {
 // setTaskEnv sets the task environment. It returns an error if it could not be
 // created.
 func (r *TaskRunner) setTaskEnv() error {
-	taskEnv, err := driver.GetTaskEnv(r.ctx.AllocDir, r.config.Node, r.task, r.alloc)
+	taskEnv, err := driver.GetTaskEnv(r.ctx.AllocDir, r.config.Node, r.task.Copy(), r.alloc)
 	if err != nil {
 		return err
 	}
@@ -285,6 +303,7 @@ func (r *TaskRunner) validateTask() error {
 func (r *TaskRunner) run() {
 	// Predeclare things so we an jump to the RESTART
 	var handleEmpty bool
+	var stopCollection chan struct{}
 
 	for {
 		// Download the task's artifacts
@@ -303,7 +322,7 @@ func (r *TaskRunner) run() {
 				if err := getter.GetArtifact(r.taskEnv, artifact, taskDir, r.logger); err != nil {
 					r.setState(structs.TaskStateDead,
 						structs.NewTaskEvent(structs.TaskArtifactDownloadFailed).SetDownloadError(err))
-					r.restartTracker.SetStartError(cstructs.NewRecoverableError(err, true))
+					r.restartTracker.SetStartError(dstructs.NewRecoverableError(err, true))
 					goto RESTART
 				}
 			}
@@ -317,6 +336,7 @@ func (r *TaskRunner) run() {
 		r.handleLock.Lock()
 		handleEmpty = r.handle == nil
 		r.handleLock.Unlock()
+
 		if handleEmpty {
 			startErr := r.startTask()
 			r.restartTracker.SetStartError(startErr)
@@ -324,10 +344,18 @@ func (r *TaskRunner) run() {
 				r.setState(structs.TaskStateDead, structs.NewTaskEvent(structs.TaskDriverFailure).SetDriverError(startErr))
 				goto RESTART
 			}
+
+			// Mark the task as started
+			r.setState(structs.TaskStateRunning, structs.NewTaskEvent(structs.TaskStarted))
+			r.runningLock.Lock()
+			r.running = true
+			r.runningLock.Unlock()
 		}
 
-		// Mark the task as started
-		r.setState(structs.TaskStateRunning, structs.NewTaskEvent(structs.TaskStarted))
+		if stopCollection == nil {
+			stopCollection = make(chan struct{})
+			go r.collectResourceUsageStats(stopCollection)
+		}
 
 		// Wait for updates
 	WAIT:
@@ -337,6 +365,13 @@ func (r *TaskRunner) run() {
 				if waitRes == nil {
 					panic("nil wait")
 				}
+
+				r.runningLock.Lock()
+				r.running = false
+				r.runningLock.Unlock()
+
+				// Stop collection of the task's resource usage
+				close(stopCollection)
 
 				// Log whether the task was successful or not.
 				r.restartTracker.SetWaitResult(waitRes)
@@ -359,6 +394,9 @@ func (r *TaskRunner) run() {
 					// We couldn't successfully destroy the resource created.
 					r.logger.Printf("[ERR] client: failed to kill task %q. Resources may have been leaked: %v", r.task.Name, err)
 				}
+
+				// Stop collection of the task's resource usage
+				close(stopCollection)
 
 				// Store that the task has been destroyed and any associated error.
 				r.setState(structs.TaskStateDead, structs.NewTaskEvent(structs.TaskKilled).SetKillError(err))
@@ -409,10 +447,12 @@ func (r *TaskRunner) run() {
 		// Clear the handle so a new driver will be created.
 		r.handleLock.Lock()
 		r.handle = nil
+		stopCollection = nil
 		r.handleLock.Unlock()
 	}
 }
 
+// startTask creates the driver and start the task.
 func (r *TaskRunner) startTask() error {
 	// Create a driver
 	driver, err := r.createDriver()
@@ -434,6 +474,54 @@ func (r *TaskRunner) startTask() error {
 	r.handle = handle
 	r.handleLock.Unlock()
 	return nil
+}
+
+// collectResourceUsageStats starts collecting resource usage stats of a Task.
+// Collection ends when the passed channel is closed
+func (r *TaskRunner) collectResourceUsageStats(stopCollection <-chan struct{}) {
+	// start collecting the stats right away and then start collecting every
+	// collection interval
+	next := time.NewTimer(0)
+	defer next.Stop()
+	for {
+		select {
+		case <-next.C:
+			ru, err := r.handle.Stats()
+			next.Reset(r.config.StatsCollectionInterval)
+
+			if err != nil {
+				// We do not log when the plugin is shutdown as this is simply a
+				// race between the stopCollection channel being closed and calling
+				// Stats on the handle.
+				if !strings.Contains(err.Error(), "connection is shut down") {
+					r.logger.Printf("[WARN] client: error fetching stats of task %v: %v", r.task.Name, err)
+				}
+				continue
+			}
+
+			r.resourceUsageLock.Lock()
+			r.resourceUsage = ru
+			r.resourceUsageLock.Unlock()
+			r.emitStats(ru)
+		case <-stopCollection:
+			return
+		}
+	}
+}
+
+// LatestResourceUsage returns the last resource utilization datapoint collected
+func (r *TaskRunner) LatestResourceUsage() *cstructs.TaskResourceUsage {
+	r.resourceUsageLock.RLock()
+	defer r.resourceUsageLock.RUnlock()
+	r.runningLock.Lock()
+	defer r.runningLock.Unlock()
+
+	// If the task is not running there can be no latest resource
+	if !r.running {
+		return nil
+	}
+
+	return r.resourceUsage
 }
 
 // handleUpdate takes an updated allocation and updates internal state to
@@ -506,7 +594,7 @@ func (r *TaskRunner) handleDestroy() (destroyed bool, err error) {
 }
 
 // Helper function for converting a WaitResult into a TaskTerminated event.
-func (r *TaskRunner) waitErrorToEvent(res *cstructs.WaitResult) *structs.TaskEvent {
+func (r *TaskRunner) waitErrorToEvent(res *dstructs.WaitResult) *structs.TaskEvent {
 	return structs.NewTaskEvent(structs.TaskTerminated).
 		SetExitCode(res.ExitCode).
 		SetSignal(res.Signal).
@@ -533,4 +621,43 @@ func (r *TaskRunner) Destroy() {
 	}
 	r.destroy = true
 	close(r.destroyCh)
+}
+
+// emitStats emits resource usage stats of tasks to remote metrics collector
+// sinks
+func (r *TaskRunner) emitStats(ru *cstructs.TaskResourceUsage) {
+	if ru.ResourceUsage.MemoryStats != nil {
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "memory", "rss"}, float32(ru.ResourceUsage.MemoryStats.RSS))
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "memory", "cache"}, float32(ru.ResourceUsage.MemoryStats.Cache))
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "memory", "swap"}, float32(ru.ResourceUsage.MemoryStats.Swap))
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "memory", "max_usage"}, float32(ru.ResourceUsage.MemoryStats.MaxUsage))
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "memory", "kernel_usage"}, float32(ru.ResourceUsage.MemoryStats.KernelUsage))
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "memory", "kernel_max_usage"}, float32(ru.ResourceUsage.MemoryStats.KernelMaxUsage))
+	}
+
+	if ru.ResourceUsage.CpuStats != nil {
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "cpu", "percent"}, float32(ru.ResourceUsage.CpuStats.Percent))
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "cpu", "system"}, float32(ru.ResourceUsage.CpuStats.SystemMode))
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "cpu", "user"}, float32(ru.ResourceUsage.CpuStats.UserMode))
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "cpu", "throttled_time"}, float32(ru.ResourceUsage.CpuStats.ThrottledTime))
+		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "cpu", "throttled_periods"}, float32(ru.ResourceUsage.CpuStats.ThrottledPeriods))
+	}
+
+	for pid, pidStats := range ru.Pids {
+		if pidStats.MemoryStats != nil {
+			// Not emitting max, kernel usages since we never get them on a per-pid
+			// basis
+			metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, pid, "memory", "rss"}, float32(pidStats.MemoryStats.RSS))
+			metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, pid, "memory", "cache"}, float32(pidStats.MemoryStats.Cache))
+			metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, pid, "memory", "swap"}, float32(pidStats.MemoryStats.Swap))
+		}
+
+		if pidStats.CpuStats != nil {
+			// Not emitting throttled time and periods since we never get them on a
+			// per pid basis
+			metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, pid, "cpu", "percent"}, float32(pidStats.CpuStats.Percent))
+			metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, pid, "cpu", "system"}, float32(pidStats.CpuStats.SystemMode))
+			metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, pid, "cpu", "user"}, float32(pidStats.CpuStats.UserMode))
+		}
+	}
 }

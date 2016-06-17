@@ -16,12 +16,14 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/go-checkpoint"
 	"github.com/hashicorp/go-syslog"
 	"github.com/hashicorp/logutils"
 	"github.com/hashicorp/nomad/helper/flag-slice"
 	"github.com/hashicorp/nomad/helper/gated-writer"
-	scada "github.com/hashicorp/scada-client"
+	"github.com/hashicorp/nomad/nomad/structs/config"
+	"github.com/hashicorp/scada-client/scada"
 	"github.com/mitchellh/cli"
 )
 
@@ -59,6 +61,7 @@ func (c *Command) readConfig() *Config {
 	// Make a new, empty config.
 	cmdConfig := &Config{
 		Atlas:  &AtlasConfig{},
+		Consul: &config.ConsulConfig{},
 		Client: &ClientConfig{},
 		Ports:  &Ports{},
 		Server: &ServerConfig{},
@@ -325,7 +328,7 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer) error {
 
 		// Do an immediate check within the next 30 seconds
 		go func() {
-			time.Sleep(randomStagger(30 * time.Second))
+			time.Sleep(lib.RandomStagger(30 * time.Second))
 			c.checkpointResults(checkpoint.Check(updateParams))
 		}()
 	}
@@ -339,7 +342,12 @@ func (c *Command) checkpointResults(results *checkpoint.CheckResponse, err error
 		return
 	}
 	if results.Outdated {
-		c.Ui.Error(fmt.Sprintf("Newer Nomad version available: %s", results.CurrentVersion))
+		versionStr := c.Version
+		if c.VersionPrerelease != "" {
+			versionStr += fmt.Sprintf("-%s", c.VersionPrerelease)
+		}
+
+		c.Ui.Error(fmt.Sprintf("Newer Nomad version available: %s (currently running: %s)", results.CurrentVersion, versionStr))
 	}
 	for _, alert := range results.Alerts {
 		switch alert.Level {
@@ -608,7 +616,26 @@ func (c *Command) setupSCADA(config *Config) error {
 
 	// Create the new provider and listener
 	c.Ui.Output("Connecting to Atlas: " + config.Atlas.Infrastructure)
-	provider, list, err := NewProvider(config, c.logOutput)
+
+	scadaConfig := &scada.Config{
+		Service:      "nomad",
+		Version:      fmt.Sprintf("%s%s", config.Version, config.VersionPrerelease),
+		ResourceType: "nomad-cluster",
+		Meta: map[string]string{
+			"auto-join":  strconv.FormatBool(config.Atlas.Join),
+			"region":     config.Region,
+			"datacenter": config.Datacenter,
+			"client":     strconv.FormatBool(config.Client != nil && config.Client.Enabled),
+			"server":     strconv.FormatBool(config.Server != nil && config.Server.Enabled),
+		},
+		Atlas: scada.AtlasConfig{
+			Endpoint:       config.Atlas.Endpoint,
+			Infrastructure: config.Atlas.Infrastructure,
+			Token:          config.Atlas.Token,
+		},
+	}
+
+	provider, list, err := scada.NewHTTPProvider(scadaConfig, c.logOutput)
 	if err != nil {
 		return err
 	}

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"sort"
 	"time"
 )
@@ -11,6 +12,12 @@ const (
 
 	// JobTypeBatch indicates a short-lived process
 	JobTypeBatch = "batch"
+)
+
+const (
+	// RegisterEnforceIndexErrPrefix is the prefix to use in errors caused by
+	// enforcing the job modify index during registers.
+	RegisterEnforceIndexErrPrefix = "Enforcing job modify index"
 )
 
 // Jobs is used to access the job-specific endpoints.
@@ -26,9 +33,27 @@ func (c *Client) Jobs() *Jobs {
 // Register is used to register a new job. It returns the ID
 // of the evaluation, along with any errors encountered.
 func (j *Jobs) Register(job *Job, q *WriteOptions) (string, *WriteMeta, error) {
+
 	var resp registerJobResponse
 
-	req := &RegisterJobRequest{job}
+	req := &RegisterJobRequest{Job: job}
+	wm, err := j.client.write("/v1/jobs", req, &resp, q)
+	if err != nil {
+		return "", nil, err
+	}
+	return resp.EvalID, wm, nil
+}
+
+// EnforceRegister is used to register a job enforcing its job modify index.
+func (j *Jobs) EnforceRegister(job *Job, modifyIndex uint64, q *WriteOptions) (string, *WriteMeta, error) {
+
+	var resp registerJobResponse
+
+	req := &RegisterJobRequest{
+		Job:            job,
+		EnforceIndex:   true,
+		JobModifyIndex: modifyIndex,
+	}
 	wm, err := j.client.write("/v1/jobs", req, &resp, q)
 	if err != nil {
 		return "", nil, err
@@ -116,6 +141,24 @@ func (j *Jobs) PeriodicForce(jobID string, q *WriteOptions) (string, *WriteMeta,
 	return resp.EvalID, wm, nil
 }
 
+func (j *Jobs) Plan(job *Job, diff bool, q *WriteOptions) (*JobPlanResponse, *WriteMeta, error) {
+	if job == nil {
+		return nil, nil, fmt.Errorf("must pass non-nil job")
+	}
+
+	var resp JobPlanResponse
+	req := &JobPlanRequest{
+		Job:  job,
+		Diff: diff,
+	}
+	wm, err := j.client.write("/v1/job/"+job.ID+"/plan", req, &resp, q)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &resp, wm, nil
+}
+
 // periodicForceResponse is used to deserialize a force response
 type periodicForceResponse struct {
 	EvalID string
@@ -153,6 +196,7 @@ type Job struct {
 	StatusDescription string
 	CreateIndex       uint64
 	ModifyIndex       uint64
+	JobModifyIndex    uint64
 }
 
 // JobListStub is used to return a subset of information about
@@ -167,6 +211,7 @@ type JobListStub struct {
 	StatusDescription string
 	CreateIndex       uint64
 	ModifyIndex       uint64
+	JobModifyIndex    uint64
 }
 
 // JobIDSort is used to sort jobs by their job ID's.
@@ -244,7 +289,9 @@ func (j *Job) AddPeriodicConfig(cfg *PeriodicConfig) *Job {
 
 // RegisterJobRequest is used to serialize a job registration
 type RegisterJobRequest struct {
-	Job *Job
+	Job            *Job
+	EnforceIndex   bool
+	JobModifyIndex uint64
 }
 
 // registerJobResponse is used to deserialize a job response
@@ -255,4 +302,70 @@ type registerJobResponse struct {
 // deregisterJobResponse is used to decode a deregister response
 type deregisterJobResponse struct {
 	EvalID string
+}
+
+type JobPlanRequest struct {
+	Job  *Job
+	Diff bool
+}
+
+type JobPlanResponse struct {
+	JobModifyIndex     uint64
+	CreatedEvals       []*Evaluation
+	Diff               *JobDiff
+	Annotations        *PlanAnnotations
+	FailedTGAllocs     map[string]*AllocationMetric
+	NextPeriodicLaunch time.Time
+}
+
+type JobDiff struct {
+	Type       string
+	ID         string
+	Fields     []*FieldDiff
+	Objects    []*ObjectDiff
+	TaskGroups []*TaskGroupDiff
+}
+
+type TaskGroupDiff struct {
+	Type    string
+	Name    string
+	Fields  []*FieldDiff
+	Objects []*ObjectDiff
+	Tasks   []*TaskDiff
+	Updates map[string]uint64
+}
+
+type TaskDiff struct {
+	Type        string
+	Name        string
+	Fields      []*FieldDiff
+	Objects     []*ObjectDiff
+	Annotations []string
+}
+
+type FieldDiff struct {
+	Type        string
+	Name        string
+	Old, New    string
+	Annotations []string
+}
+
+type ObjectDiff struct {
+	Type    string
+	Name    string
+	Fields  []*FieldDiff
+	Objects []*ObjectDiff
+}
+
+type PlanAnnotations struct {
+	DesiredTGUpdates map[string]*DesiredUpdates
+}
+
+type DesiredUpdates struct {
+	Ignore            uint64
+	Place             uint64
+	Migrate           uint64
+	Stop              uint64
+	InPlaceUpdate     uint64
+	DestructiveUpdate uint64
 }

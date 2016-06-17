@@ -45,6 +45,10 @@ client {
 	client_min_port = 1000
 	client_max_port = 2000
     max_kill_timeout = "10s"
+    stats {
+        data_points = 35
+        collection_interval = "5s"
+    }
 }
 server {
 	enabled = true
@@ -65,6 +69,7 @@ telemetry {
 	statsite_address = "127.0.0.1:1234"
 	statsd_address = "127.0.0.1:2345"
 	disable_hostname = true
+    collection_interval = "3s"
 }
 leave_on_interrupt = true
 leave_on_terminate = true
@@ -80,4 +85,19 @@ atlas {
 }
 http_api_response_headers {
 	Access-Control-Allow-Origin = "*"
+}
+consul {
+    server_service_name = "nomad"
+    client_service_name = "nomad-client"
+    address = "127.0.0.1:9500"
+    token = "token1"
+    auth = "username:pass"
+    ssl = true
+    verify_ssl = false
+    ca_file = "/path/to/ca/file"
+    cert_file = "/path/to/cert/file"
+    key_file = "/path/to/key/file"
+    server_auto_join = false
+    client_auto_join = false
+    auto_advertise = false
 }

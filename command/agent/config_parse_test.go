@@ -4,6 +4,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
+
+	"github.com/hashicorp/nomad/nomad/structs/config"
 )
 
 func TestConfig_Parse(t *testing.T) {
@@ -80,9 +83,11 @@ func TestConfig_Parse(t *testing.T) {
 					RetryMaxAttempts:  3,
 				},
 				Telemetry: &Telemetry{
-					StatsiteAddr:    "127.0.0.1:1234",
-					StatsdAddr:      "127.0.0.1:2345",
-					DisableHostname: true,
+					StatsiteAddr:       "127.0.0.1:1234",
+					StatsdAddr:         "127.0.0.1:2345",
+					DisableHostname:    true,
+					CollectionInterval: "3s",
+					collectionInterval: 3 * time.Second,
 				},
 				LeaveOnInt:                true,
 				LeaveOnTerm:               true,
@@ -95,6 +100,21 @@ func TestConfig_Parse(t *testing.T) {
 					Token:          "abcd",
 					Join:           true,
 					Endpoint:       "127.0.0.1:1234",
+				},
+				Consul: &config.ConsulConfig{
+					ServerServiceName: "nomad",
+					ClientServiceName: "nomad-client",
+					Addr:              "127.0.0.1:9500",
+					Token:             "token1",
+					Auth:              "username:pass",
+					EnableSSL:         true,
+					VerifySSL:         false,
+					CAFile:            "/path/to/ca/file",
+					CertFile:          "/path/to/cert/file",
+					KeyFile:           "/path/to/key/file",
+					ServerAutoJoin:    false,
+					ClientAutoJoin:    false,
+					AutoAdvertise:     false,
 				},
 				HTTPAPIResponseHeaders: map[string]string{
 					"Access-Control-Allow-Origin": "*",

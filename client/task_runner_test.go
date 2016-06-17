@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/client/allocdir"
+	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -45,7 +46,7 @@ func testTaskRunner(restarts bool) (*MockTaskStateUpdater, *TaskRunner) {
 // the passed allocation.
 func testTaskRunnerFromAlloc(restarts bool, alloc *structs.Allocation) (*MockTaskStateUpdater, *TaskRunner) {
 	logger := testLogger()
-	conf := DefaultConfig()
+	conf := config.DefaultConfig()
 	conf.StateDir = os.TempDir()
 	conf.AllocDir = os.TempDir()
 	upd := &MockTaskStateUpdater{}
@@ -128,6 +129,13 @@ func TestTaskRunner_Destroy(t *testing.T) {
 	}, func(err error) {
 		t.Fatalf("err: %v", err)
 	})
+
+	// Make sure we are collecting  afew stats
+	time.Sleep(2 * time.Second)
+	stats := tr.LatestResourceUsage()
+	if len(stats.Pids) == 0 || stats.ResourceUsage == nil || stats.ResourceUsage.MemoryStats.RSS == 0 {
+		t.Fatalf("expected task runner to have some stats")
+	}
 
 	// Begin the tear down
 	tr.Destroy()
@@ -395,5 +403,4 @@ func TestTaskRunner_Validate_UserEnforcement(t *testing.T) {
 	if err := tr.validateTask(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 }

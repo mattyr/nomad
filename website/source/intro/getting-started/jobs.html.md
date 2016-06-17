@@ -115,12 +115,12 @@ CPU  Memory MB  Disk MB  IOPS  Addresses
 500  256        300      0     db: 127.0.0.1:52004
 ```
 
-To inspect the file system of a running allocation, we can use the [`fs ls`
+To inspect the file system of a running allocation, we can use the [`fs`
 command](/docs/commands/fs.html):
 
 ```
 $ nomad fs ls 8ba85cef alloc/logs
-Mode        Size    Modfied Time           Name
+Mode        Size    Modified Time          Name
 -rw-rw-r--  0 B     15/03/16 15:40:56 PDT  redis.stderr.0
 -rw-rw-r--  2.3 kB  15/03/16 15:40:57 PDT  redis.stdout.0
 

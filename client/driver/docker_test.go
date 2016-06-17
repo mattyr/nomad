@@ -143,7 +143,7 @@ func TestDockerDriver_Handle(t *testing.T) {
 		containerID:    "containerid",
 		killTimeout:    5 * time.Nanosecond,
 		maxKillTimeout: 15 * time.Nanosecond,
-		doneCh:         make(chan struct{}),
+		doneCh:         make(chan bool),
 		waitCh:         make(chan *cstructs.WaitResult, 1),
 	}
 
@@ -223,7 +223,7 @@ func TestDockerDriver_Start_Wait(t *testing.T) {
 		Name: "redis-demo",
 		Config: map[string]interface{}{
 			"image":   "redis",
-			"command": "redis-server",
+			"command": "/usr/local/bin/redis-server",
 			"args":    []string{"-v"},
 		},
 		Resources: &structs.Resources{
@@ -256,6 +256,10 @@ func TestDockerDriver_Start_Wait(t *testing.T) {
 }
 
 func TestDockerDriver_Start_LoadImage(t *testing.T) {
+	t.Parallel()
+	if !testutil.DockerIsConnected(t) {
+		t.SkipNow()
+	}
 	task := &structs.Task{
 		Name: "busybox-demo",
 		Config: map[string]interface{}{
@@ -433,7 +437,7 @@ func TestDocker_StartN(t *testing.T) {
 
 	handles := make([]DriverHandle, len(taskList))
 
-	t.Logf("==> Starting %d tasks", len(taskList))
+	t.Logf("Starting %d tasks", len(taskList))
 
 	// Let's spin up a bunch of things
 	var err error
@@ -448,7 +452,7 @@ func TestDocker_StartN(t *testing.T) {
 		}
 	}
 
-	t.Log("==> All tasks are started. Terminating...")
+	t.Log("All tasks are started. Terminating...")
 
 	for idx, handle := range handles {
 		if handle == nil {
@@ -462,7 +466,7 @@ func TestDocker_StartN(t *testing.T) {
 		}
 	}
 
-	t.Log("==> Test complete!")
+	t.Log("Test complete!")
 }
 
 func TestDocker_StartNVersions(t *testing.T) {
@@ -484,7 +488,7 @@ func TestDocker_StartNVersions(t *testing.T) {
 
 	handles := make([]DriverHandle, len(taskList))
 
-	t.Logf("==> Starting %d tasks", len(taskList))
+	t.Logf("Starting %d tasks", len(taskList))
 
 	// Let's spin up a bunch of things
 	var err error
@@ -499,7 +503,7 @@ func TestDocker_StartNVersions(t *testing.T) {
 		}
 	}
 
-	t.Log("==> All tasks are started. Terminating...")
+	t.Log("All tasks are started. Terminating...")
 
 	for idx, handle := range handles {
 		if handle == nil {
@@ -513,7 +517,7 @@ func TestDocker_StartNVersions(t *testing.T) {
 		}
 	}
 
-	t.Log("==> Test complete!")
+	t.Log("Test complete!")
 }
 
 func TestDockerHostNet(t *testing.T) {
@@ -752,9 +756,20 @@ func TestDockerUser(t *testing.T) {
 		handle.Kill()
 		t.Fatalf("Should've failed")
 	}
-	msg := "System error: Unable to find user alice"
-	if !strings.Contains(err.Error(), msg) {
-		t.Fatalf("Expecting '%v' in '%v'", msg, err)
+
+	msgs := []string{
+		"System error: Unable to find user alice",
+		"linux spec user: Unable to find user alice",
+	}
+	var found bool
+	for _, msg := range msgs {
+		if strings.Contains(err.Error(), msg) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Expected failure string not found, found %q instead", err.Error())
 	}
 }
 
@@ -801,6 +816,52 @@ func TestDockerDriver_CleanupContainer(t *testing.T) {
 		}
 
 	case <-time.After(time.Duration(tu.TestMultiplier()*5) * time.Second):
+		t.Fatalf("timeout")
+	}
+
+}
+
+func TestDockerDriver_Stats(t *testing.T) {
+	t.Parallel()
+	task := &structs.Task{
+		Name: "sleep",
+		Config: map[string]interface{}{
+			"image":   "busybox",
+			"command": "/bin/sleep",
+			"args":    []string{"100"},
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+		Resources: basicResources,
+	}
+
+	_, handle, cleanup := dockerSetup(t, task)
+	defer cleanup()
+
+	go func() {
+		time.Sleep(3 * time.Second)
+		ru, err := handle.Stats()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if ru.ResourceUsage == nil {
+			handle.Kill()
+			t.Fatalf("expected resource usage")
+		}
+		err = handle.Kill()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+	}()
+
+	select {
+	case res := <-handle.WaitCh():
+		if res.Successful() {
+			t.Fatalf("should err: %v", res)
+		}
+	case <-time.After(time.Duration(tu.TestMultiplier()*10) * time.Second):
 		t.Fatalf("timeout")
 	}
 

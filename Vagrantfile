@@ -4,7 +4,11 @@
 # Vagrantfile API/syntax version. Don't touch unless you know what you're doing!
 VAGRANTFILE_API_VERSION = "2"
 
+DEFAULT_CPU_COUNT = 2
 $script = <<SCRIPT
+GO_VERSION="1.6.2"
+CONSUL_VERSION="0.6.4"
+
 # Install Prereq Packages
 sudo apt-get update
 sudo apt-get install -y build-essential curl git-core mercurial bzr libpcre3-dev pkg-config zip default-jre qemu libc6-dev-i386 silversearcher-ag jq htop vim unzip
@@ -18,8 +22,8 @@ ARCH=`uname -m | sed 's|i686|386|' | sed 's|x86_64|amd64|'`
 
 # Install Go
 cd /tmp
-wget -q https://storage.googleapis.com/golang/go1.6.linux-${ARCH}.tar.gz
-tar -xf go1.6.linux-${ARCH}.tar.gz
+wget -q https://storage.googleapis.com/golang/go${GO_VERSION}.linux-${ARCH}.tar.gz
+tar -xf go${GO_VERSION}.linux-${ARCH}.tar.gz
 sudo mv go $SRCROOT
 sudo chmod 775 $SRCROOT
 sudo chown vagrant:vagrant $SRCROOT
@@ -42,7 +46,7 @@ source /etc/profile.d/gopath.sh
 
 echo Fetching Consul...
 cd /tmp/
-wget https://releases.hashicorp.com/consul/0.6.4/consul_0.6.4_linux_amd64.zip -O consul.zip
+wget https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip -O consul.zip
 echo Installing Consul...
 unzip consul.zip
 sudo chmod +x consul
@@ -70,34 +74,64 @@ bash scripts/install_rkt.sh
 grep "cd /opt/gopath/src/github.com/hashicorp/nomad" ~/.profile || echo "cd /opt/gopath/src/github.com/hashicorp/nomad" >> ~/.profile
 SCRIPT
 
-Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
-  config.vm.box = "cbednarski/ubuntu-1404"
-  config.vm.hostname = "nomad"
+def configureVM(vmCfg, vmParams={
+                  numCPUs: DEFAULT_CPU_COUNT,
+                }
+               )
+  vmCfg.vm.box = "cbednarski/ubuntu-1404"
 
-  config.vm.provision "shell", inline: $script, privileged: false
-  config.vm.synced_folder '.', '/opt/gopath/src/github.com/hashicorp/nomad'
+  vmCfg.vm.provision "shell", inline: $script, privileged: false
+  vmCfg.vm.synced_folder '.', '/opt/gopath/src/github.com/hashicorp/nomad'
 
   # We're going to compile go and run a concurrent system, so give ourselves
-  # some extra resources. Nomad will have trouble working correctly with <2 CPUs
-  # so we should use at least that many.
-  cpus = 2
+  # some extra resources. Nomad will have trouble working correctly with <2
+  # CPUs so we should use at least that many.
+  cpus = vmParams.fetch(:numCPUs, DEFAULT_CPU_COUNT)
   memory = 2048
 
-  config.vm.provider "parallels" do |p, o|
+  vmCfg.vm.provider "parallels" do |p, o|
     o.vm.box = "parallels/ubuntu-14.04"
     p.memory = memory
     p.cpus = cpus
   end
 
-  config.vm.provider "virtualbox" do |v|
+  vmCfg.vm.provider "virtualbox" do |v|
     v.memory = memory
     v.cpus = cpus
   end
 
   ["vmware_fusion", "vmware_workstation"].each do |p|
-    config.vm.provider p do |v|
+    vmCfg.vm.provider p do |v|
+      v.gui = false
       v.memory = memory
       v.cpus = cpus
+    end
+  end
+  return vmCfg
+end
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  1.upto(3) do |n|
+    vmName = "nomad-server%02d" % [n]
+    isFirstBox = (n == 1)
+
+    numCPUs = DEFAULT_CPU_COUNT
+    if isFirstBox and Object::RUBY_PLATFORM =~ /darwin/i
+      # Override the max CPUs for the first VM
+      numCPUs = [numCPUs, (`/usr/sbin/sysctl -n hw.ncpu`.to_i - 1)].max
+    end
+
+    config.vm.define vmName, autostart: isFirstBox, primary: isFirstBox do |vmCfg|
+      vmCfg.vm.hostname = vmName
+      vmCfg = configureVM(vmCfg, {:numCPUs => numCPUs})
+    end
+  end
+
+  1.upto(3) do |n|
+    vmName = "nomad-client%02d" % [n]
+    config.vm.define vmName, autostart: false, primary: false do |vmCfg|
+      vmCfg.vm.hostname = vmName
+      vmCfg = configureVM(vmCfg)
     end
   end
 end

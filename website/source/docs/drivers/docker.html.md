@@ -105,6 +105,8 @@ The following options are available for use in the job specification.
 
 * `interactive` - (Optional) `true` or `false` (default). Keep STDIN open on
   the container.
+  
+* `shm_size` - (Optional) The size (bytes) of /dev/shm for the container.
 
 ### Container Name
 
@@ -207,7 +209,12 @@ If you prefer to use the traditional port-mapping method, you can specify the
 task "redis" {
     driver = "docker"
 
-    port "redis" {}
+    resources {
+        network {
+            mbits = 20
+            port "redis" {}
+        }
+    }
 
     config {
       image = "redis"
@@ -286,6 +293,9 @@ options](/docs/agent/config.html#options):
 
 * `docker.cleanup.image` Defaults to `true`. Changing this to `false` will
   prevent Nomad from removing images from stopped tasks.
+
+* `docker.volumes.selinuxlabel`: Allows the operator to set a SELinux
+  label to the allocation and task local bind-mounts to containers.
 
 * `docker.privileged.enabled` Defaults to `false`. Changing this to `true` will
   allow containers to use `privileged` mode, which gives the containers full

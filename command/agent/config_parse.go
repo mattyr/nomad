@@ -6,10 +6,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
+	"github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/mitchellh/mapstructure"
 )
 
@@ -90,6 +92,7 @@ func parseConfig(result *Config, list *ast.ObjectList) error {
 		"disable_update_check",
 		"disable_anonymous_signature",
 		"atlas",
+		"consul",
 		"http_api_response_headers",
 	}
 	if err := checkHCLKeys(list, valid); err != nil {
@@ -109,6 +112,7 @@ func parseConfig(result *Config, list *ast.ObjectList) error {
 	delete(m, "server")
 	delete(m, "telemetry")
 	delete(m, "atlas")
+	delete(m, "consul")
 	delete(m, "http_api_response_headers")
 
 	// Decode the rest
@@ -162,6 +166,13 @@ func parseConfig(result *Config, list *ast.ObjectList) error {
 	if o := list.Filter("atlas"); len(o.Items) > 0 {
 		if err := parseAtlas(&result.Atlas, o); err != nil {
 			return multierror.Prefix(err, "atlas ->")
+		}
+	}
+
+	// Parse the consul config
+	if o := list.Filter("consul"); len(o.Items) > 0 {
+		if err := parseConsulConfig(&result.Consul, o); err != nil {
+			return multierror.Prefix(err, "consul ->")
 		}
 	}
 
@@ -310,6 +321,7 @@ func parseClient(result **ClientConfig, list *ast.ObjectList) error {
 		"client_max_port",
 		"client_min_port",
 		"reserved",
+		"stats",
 	}
 	if err := checkHCLKeys(listVal, valid); err != nil {
 		return err
@@ -323,6 +335,7 @@ func parseClient(result **ClientConfig, list *ast.ObjectList) error {
 	delete(m, "options")
 	delete(m, "meta")
 	delete(m, "reserved")
+	delete(m, "stats")
 
 	var config ClientConfig
 	if err := mapstructure.WeakDecode(m, &config); err != nil {
@@ -479,6 +492,7 @@ func parseTelemetry(result **Telemetry, list *ast.ObjectList) error {
 		"statsite_address",
 		"statsd_address",
 		"disable_hostname",
+		"collection_interval",
 	}
 	if err := checkHCLKeys(listVal, valid); err != nil {
 		return err
@@ -492,6 +506,13 @@ func parseTelemetry(result **Telemetry, list *ast.ObjectList) error {
 	var telemetry Telemetry
 	if err := mapstructure.WeakDecode(m, &telemetry); err != nil {
 		return err
+	}
+	if telemetry.CollectionInterval != "" {
+		if dur, err := time.ParseDuration(telemetry.CollectionInterval); err != nil {
+			return fmt.Errorf("error parsing value of %q: %v", "collection_interval", err)
+		} else {
+			telemetry.collectionInterval = dur
+		}
 	}
 	*result = &telemetry
 	return nil
@@ -527,6 +548,59 @@ func parseAtlas(result **AtlasConfig, list *ast.ObjectList) error {
 		return err
 	}
 	*result = &atlas
+	return nil
+}
+
+func parseConsulConfig(result **config.ConsulConfig, list *ast.ObjectList) error {
+	list = list.Elem()
+	if len(list.Items) > 1 {
+		return fmt.Errorf("only one 'consul' block allowed")
+	}
+
+	// Get our consul object
+	listVal := list.Items[0].Val
+
+	// Check for invalid keys
+	valid := []string{
+		"address",
+		"auth",
+		"auto_advertise",
+		"ca_file",
+		"cert_file",
+		"client_auto_join",
+		"client_service_name",
+		"key_file",
+		"server_auto_join",
+		"server_service_name",
+		"ssl",
+		"timeout",
+		"token",
+		"verify_ssl",
+	}
+
+	if err := checkHCLKeys(listVal, valid); err != nil {
+		return err
+	}
+
+	var m map[string]interface{}
+	if err := hcl.DecodeObject(&m, listVal); err != nil {
+		return err
+	}
+
+	var consulConfig config.ConsulConfig
+	dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		DecodeHook:       mapstructure.StringToTimeDurationHookFunc(),
+		WeaklyTypedInput: true,
+		Result:           &consulConfig,
+	})
+	if err != nil {
+		return err
+	}
+	if err := dec.Decode(m); err != nil {
+		return err
+	}
+
+	*result = &consulConfig
 	return nil
 }
 

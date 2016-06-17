@@ -3,15 +3,20 @@ package nomad
 import (
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/nomad/command/agent/consul"
 	"github.com/hashicorp/nomad/testutil"
 )
 
-var nextPort uint32 = 15000
+var (
+	nextPort   uint32 = 15000
+	nodeNumber uint32 = 0
+)
 
 func getPort() int {
 	return int(atomic.AddUint32(&nextPort, 1))
@@ -34,7 +39,8 @@ func testServer(t *testing.T, cb func(*Config)) *Server {
 		IP:   []byte{127, 0, 0, 1},
 		Port: getPort(),
 	}
-	config.NodeName = fmt.Sprintf("Node %d", config.RPCAddr.Port)
+	nodeNum := atomic.AddUint32(&nodeNumber, 1)
+	config.NodeName = fmt.Sprintf("nomad-%03d", nodeNum)
 
 	// Tighten the Serf timing
 	config.SerfConfig.MemberlistConfig.BindAddr = "127.0.0.1"
@@ -59,8 +65,14 @@ func testServer(t *testing.T, cb func(*Config)) *Server {
 	// Enable raft as leader if we have bootstrap on
 	config.RaftConfig.StartAsLeader = !config.DevDisableBootstrap
 
+	shutdownCh := make(chan struct{})
+	consulSyncer, err := consul.NewSyncer(config.ConsulConfig, shutdownCh, log.New(config.LogOutput, "", log.LstdFlags))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
 	// Create server
-	server, err := NewServer(config)
+	server, err := NewServer(config, consulSyncer)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}

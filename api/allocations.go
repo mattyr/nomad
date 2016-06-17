@@ -1,8 +1,11 @@
 package api
 
 import (
+	"fmt"
 	"sort"
 	"time"
+
+	"github.com/hashicorp/go-cleanhttp"
 )
 
 // Allocations is used to query the alloc-related endpoints.
@@ -38,6 +41,26 @@ func (a *Allocations) Info(allocID string, q *QueryOptions) (*Allocation, *Query
 		return nil, nil, err
 	}
 	return &resp, qm, nil
+}
+
+func (a *Allocations) Stats(alloc *Allocation, q *QueryOptions) (*AllocResourceUsage, error) {
+	node, _, err := a.client.Nodes().Info(alloc.NodeID, q)
+	if err != nil {
+		return nil, err
+	}
+	if node.HTTPAddr == "" {
+		return nil, fmt.Errorf("http addr of the node where alloc %q is running is not advertised", alloc.ID)
+	}
+	client, err := NewClient(&Config{
+		Address:    fmt.Sprintf("http://%s", node.HTTPAddr),
+		HttpClient: cleanhttp.DefaultClient(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	var resp AllocResourceUsage
+	_, err = client.query("/v1/client/allocation/"+alloc.ID+"/stats", &resp, nil)
+	return &resp, err
 }
 
 // Allocation is used for serialization of allocations.

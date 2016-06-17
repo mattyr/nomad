@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -42,6 +43,19 @@ func TestServiceSched_JobRegister(t *testing.T) {
 	}
 	plan := h.Plans[0]
 
+	// Ensure the plan doesn't have annotations.
+	if plan.Annotations != nil {
+		t.Fatalf("expected no annotations")
+	}
+
+	// Ensure the eval has no spawned blocked eval
+	if len(h.Evals) != 1 {
+		t.Fatalf("bad: %#v", h.Evals)
+		if h.Evals[0].BlockedEval != "" {
+			t.Fatalf("bad: %#v", h.Evals[0])
+		}
+	}
+
 	// Ensure the plan allocated
 	var planned []*structs.Allocation
 	for _, allocList := range plan.NodeAllocation {
@@ -74,6 +88,81 @@ func TestServiceSched_JobRegister(t *testing.T) {
 	}
 
 	h.AssertEvalStatus(t, structs.EvalStatusComplete)
+}
+
+func TestServiceSched_JobRegister_Annotate(t *testing.T) {
+	h := NewHarness(t)
+
+	// Create some nodes
+	for i := 0; i < 10; i++ {
+		node := mock.Node()
+		noErr(t, h.State.UpsertNode(h.NextIndex(), node))
+	}
+
+	// Create a job
+	job := mock.Job()
+	noErr(t, h.State.UpsertJob(h.NextIndex(), job))
+
+	// Create a mock evaluation to register the job
+	eval := &structs.Evaluation{
+		ID:           structs.GenerateUUID(),
+		Priority:     job.Priority,
+		TriggeredBy:  structs.EvalTriggerJobRegister,
+		JobID:        job.ID,
+		AnnotatePlan: true,
+	}
+
+	// Process the evaluation
+	err := h.Process(NewServiceScheduler, eval)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure a single plan
+	if len(h.Plans) != 1 {
+		t.Fatalf("bad: %#v", h.Plans)
+	}
+	plan := h.Plans[0]
+
+	// Ensure the plan allocated
+	var planned []*structs.Allocation
+	for _, allocList := range plan.NodeAllocation {
+		planned = append(planned, allocList...)
+	}
+	if len(planned) != 10 {
+		t.Fatalf("bad: %#v", plan)
+	}
+
+	// Lookup the allocations by JobID
+	out, err := h.State.AllocsByJob(job.ID)
+	noErr(t, err)
+
+	// Ensure all allocations placed
+	if len(out) != 10 {
+		t.Fatalf("bad: %#v", out)
+	}
+
+	h.AssertEvalStatus(t, structs.EvalStatusComplete)
+
+	// Ensure the plan had annotations.
+	if plan.Annotations == nil {
+		t.Fatalf("expected annotations")
+	}
+
+	desiredTGs := plan.Annotations.DesiredTGUpdates
+	if l := len(desiredTGs); l != 1 {
+		t.Fatalf("incorrect number of task groups; got %v; want %v", l, 1)
+	}
+
+	desiredChanges, ok := desiredTGs["web"]
+	if !ok {
+		t.Fatalf("expected task group web to have desired changes")
+	}
+
+	expected := &structs.DesiredUpdates{Place: 10}
+	if !reflect.DeepEqual(desiredChanges, expected) {
+		t.Fatalf("Unexpected desired updates; got %#v; want %#v", desiredChanges, expected)
+	}
 }
 
 func TestServiceSched_JobRegister_CountZero(t *testing.T) {
@@ -143,45 +232,50 @@ func TestServiceSched_JobRegister_AllocFail(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Ensure a single plan
-	if len(h.Plans) != 1 {
+	// Ensure no plan
+	if len(h.Plans) != 0 {
 		t.Fatalf("bad: %#v", h.Plans)
 	}
-	plan := h.Plans[0]
 
-	// Ensure the plan has created a follow up eval.
+	// Ensure there is a follow up eval.
 	if len(h.CreateEvals) != 1 || h.CreateEvals[0].Status != structs.EvalStatusBlocked {
 		t.Fatalf("bad: %#v", h.CreateEvals)
 	}
 
-	// Ensure the plan failed to alloc
-	if len(plan.FailedAllocs) != 1 {
-		t.Fatalf("bad: %#v", plan)
+	if len(h.Evals) != 1 {
+		t.Fatalf("incorrect number of updated eval: %#v", h.Evals)
+	}
+	outEval := h.Evals[0]
+
+	// Ensure the eval has its spawned blocked eval
+	if outEval.BlockedEval != h.CreateEvals[0].ID {
+		t.Fatalf("bad: %#v", outEval)
 	}
 
-	// Lookup the allocations by JobID
-	out, err := h.State.AllocsByJob(job.ID)
-	noErr(t, err)
+	// Ensure the plan failed to alloc
+	if outEval == nil || len(outEval.FailedTGAllocs) != 1 {
+		t.Fatalf("bad: %#v", outEval)
+	}
 
-	// Ensure all allocations placed
-	if len(out) != 1 {
-		t.Fatalf("bad: %#v", out)
+	metrics, ok := outEval.FailedTGAllocs[job.TaskGroups[0].Name]
+	if !ok {
+		t.Fatalf("no failed metrics: %#v", outEval.FailedTGAllocs)
 	}
 
 	// Check the coalesced failures
-	if out[0].Metrics.CoalescedFailures != 9 {
-		t.Fatalf("bad: %#v", out[0].Metrics)
+	if metrics.CoalescedFailures != 9 {
+		t.Fatalf("bad: %#v", metrics)
 	}
 
 	// Check the available nodes
-	if count, ok := out[0].Metrics.NodesAvailable["dc1"]; !ok || count != 0 {
-		t.Fatalf("bad: %#v", out[0].Metrics)
+	if count, ok := metrics.NodesAvailable["dc1"]; !ok || count != 0 {
+		t.Fatalf("bad: %#v", metrics)
 	}
 
 	h.AssertEvalStatus(t, structs.EvalStatusComplete)
 }
 
-func TestServiceSched_JobRegister_BlockedEval(t *testing.T) {
+func TestServiceSched_JobRegister_CreateBlockedEval(t *testing.T) {
 	h := NewHarness(t)
 
 	// Create a full node
@@ -214,11 +308,10 @@ func TestServiceSched_JobRegister_BlockedEval(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Ensure a single plan
-	if len(h.Plans) != 1 {
+	// Ensure no plan
+	if len(h.Plans) != 0 {
 		t.Fatalf("bad: %#v", h.Plans)
 	}
-	plan := h.Plans[0]
 
 	// Ensure the plan has created a follow up eval.
 	if len(h.CreateEvals) != 1 {
@@ -239,31 +332,34 @@ func TestServiceSched_JobRegister_BlockedEval(t *testing.T) {
 		t.Fatalf("bad: %#v", created)
 	}
 
-	// Ensure the plan failed to alloc
-	if len(plan.FailedAllocs) != 1 {
-		t.Fatalf("bad: %#v", plan)
+	// Ensure there is a follow up eval.
+	if len(h.CreateEvals) != 1 || h.CreateEvals[0].Status != structs.EvalStatusBlocked {
+		t.Fatalf("bad: %#v", h.CreateEvals)
 	}
 
-	// Lookup the allocations by JobID
-	out, err := h.State.AllocsByJob(job.ID)
-	noErr(t, err)
+	if len(h.Evals) != 1 {
+		t.Fatalf("incorrect number of updated eval: %#v", h.Evals)
+	}
+	outEval := h.Evals[0]
 
-	// Ensure all allocations placed
-	if len(out) != 1 {
-		for _, a := range out {
-			t.Logf("%#v", a)
-		}
-		t.Fatalf("bad: %#v", out)
+	// Ensure the plan failed to alloc
+	if outEval == nil || len(outEval.FailedTGAllocs) != 1 {
+		t.Fatalf("bad: %#v", outEval)
+	}
+
+	metrics, ok := outEval.FailedTGAllocs[job.TaskGroups[0].Name]
+	if !ok {
+		t.Fatalf("no failed metrics: %#v", outEval.FailedTGAllocs)
 	}
 
 	// Check the coalesced failures
-	if out[0].Metrics.CoalescedFailures != 9 {
-		t.Fatalf("bad: %#v", out[0].Metrics)
+	if metrics.CoalescedFailures != 9 {
+		t.Fatalf("bad: %#v", metrics)
 	}
 
 	// Check the available nodes
-	if count, ok := out[0].Metrics.NodesAvailable["dc1"]; !ok || count != 2 {
-		t.Fatalf("bad: %#v", out[0].Metrics)
+	if count, ok := metrics.NodesAvailable["dc1"]; !ok || count != 2 {
+		t.Fatalf("bad: %#v", metrics)
 	}
 
 	h.AssertEvalStatus(t, structs.EvalStatusComplete)
@@ -322,7 +418,142 @@ func TestServiceSched_JobRegister_FeasibleAndInfeasibleTG(t *testing.T) {
 	if len(planned) != 2 {
 		t.Fatalf("bad: %#v", plan)
 	}
-	if len(plan.FailedAllocs) != 1 {
+
+	// Ensure two allocations placed
+	out, err := h.State.AllocsByJob(job.ID)
+	noErr(t, err)
+	if len(out) != 2 {
+		t.Fatalf("bad: %#v", out)
+	}
+
+	if len(h.Evals) != 1 {
+		t.Fatalf("incorrect number of updated eval: %#v", h.Evals)
+	}
+	outEval := h.Evals[0]
+
+	// Ensure the eval has its spawned blocked eval
+	if outEval.BlockedEval != h.CreateEvals[0].ID {
+		t.Fatalf("bad: %#v", outEval)
+	}
+
+	// Ensure the plan failed to alloc one tg
+	if outEval == nil || len(outEval.FailedTGAllocs) != 1 {
+		t.Fatalf("bad: %#v", outEval)
+	}
+
+	metrics, ok := outEval.FailedTGAllocs[tg2.Name]
+	if !ok {
+		t.Fatalf("no failed metrics: %#v", outEval.FailedTGAllocs)
+	}
+
+	// Check the coalesced failures
+	if metrics.CoalescedFailures != tg2.Count-1 {
+		t.Fatalf("bad: %#v", metrics)
+	}
+
+	h.AssertEvalStatus(t, structs.EvalStatusComplete)
+}
+
+func TestServiceSched_EvaluateBlockedEval(t *testing.T) {
+	h := NewHarness(t)
+
+	// Create a job and set the task group count to zero.
+	job := mock.Job()
+	noErr(t, h.State.UpsertJob(h.NextIndex(), job))
+
+	// Create a mock blocked evaluation
+	eval := &structs.Evaluation{
+		ID:          structs.GenerateUUID(),
+		Status:      structs.EvalStatusBlocked,
+		Priority:    job.Priority,
+		TriggeredBy: structs.EvalTriggerJobRegister,
+		JobID:       job.ID,
+	}
+
+	// Insert it into the state store
+	noErr(t, h.State.UpsertEvals(h.NextIndex(), []*structs.Evaluation{eval}))
+
+	// Process the evaluation
+	err := h.Process(NewServiceScheduler, eval)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure there was no plan
+	if len(h.Plans) != 0 {
+		t.Fatalf("bad: %#v", h.Plans)
+	}
+
+	// Ensure that the eval was reblocked
+	if len(h.ReblockEvals) != 1 {
+		t.Fatalf("bad: %#v", h.ReblockEvals)
+	}
+	if h.ReblockEvals[0].ID != eval.ID {
+		t.Fatalf("expect same eval to be reblocked; got %q; want %q", h.ReblockEvals[0].ID, eval.ID)
+	}
+
+	// Ensure the eval status was not updated
+	if len(h.Evals) != 0 {
+		t.Fatalf("Existing eval should not have status set")
+	}
+}
+
+func TestServiceSched_EvaluateBlockedEval_Finished(t *testing.T) {
+	h := NewHarness(t)
+
+	// Create some nodes
+	for i := 0; i < 10; i++ {
+		node := mock.Node()
+		noErr(t, h.State.UpsertNode(h.NextIndex(), node))
+	}
+
+	// Create a job and set the task group count to zero.
+	job := mock.Job()
+	noErr(t, h.State.UpsertJob(h.NextIndex(), job))
+
+	// Create a mock blocked evaluation
+	eval := &structs.Evaluation{
+		ID:          structs.GenerateUUID(),
+		Status:      structs.EvalStatusBlocked,
+		Priority:    job.Priority,
+		TriggeredBy: structs.EvalTriggerJobRegister,
+		JobID:       job.ID,
+	}
+
+	// Insert it into the state store
+	noErr(t, h.State.UpsertEvals(h.NextIndex(), []*structs.Evaluation{eval}))
+
+	// Process the evaluation
+	err := h.Process(NewServiceScheduler, eval)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure a single plan
+	if len(h.Plans) != 1 {
+		t.Fatalf("bad: %#v", h.Plans)
+	}
+	plan := h.Plans[0]
+
+	// Ensure the plan doesn't have annotations.
+	if plan.Annotations != nil {
+		t.Fatalf("expected no annotations")
+	}
+
+	// Ensure the eval has no spawned blocked eval
+	if len(h.Evals) != 1 {
+		t.Fatalf("bad: %#v", h.Evals)
+		if h.Evals[0].BlockedEval != "" {
+			t.Fatalf("bad: %#v", h.Evals[0])
+		}
+	}
+
+	// Ensure the plan allocated
+	var planned []*structs.Allocation
+	for _, allocList := range plan.NodeAllocation {
+		planned = append(planned, allocList...)
+	}
+	if len(planned) != 10 {
 		t.Fatalf("bad: %#v", plan)
 	}
 
@@ -331,8 +562,13 @@ func TestServiceSched_JobRegister_FeasibleAndInfeasibleTG(t *testing.T) {
 	noErr(t, err)
 
 	// Ensure all allocations placed
-	if len(out) != 3 {
+	if len(out) != 10 {
 		t.Fatalf("bad: %#v", out)
+	}
+
+	// Ensure the eval was not reblocked
+	if len(h.ReblockEvals) != 0 {
+		t.Fatalf("Existing eval should not have been reblocked as it placed all allocations")
 	}
 
 	h.AssertEvalStatus(t, structs.EvalStatusComplete)
@@ -505,9 +741,13 @@ func TestServiceSched_JobModify_IncrCount_NodeLimit(t *testing.T) {
 		t.Fatalf("bad: %#v", plan)
 	}
 
-	// Ensure the plan didn't to alloc
-	if len(plan.FailedAllocs) != 0 {
-		t.Fatalf("bad: %#v", plan)
+	// Ensure the plan had no failures
+	if len(h.Evals) != 1 {
+		t.Fatalf("incorrect number of updated eval: %#v", h.Evals)
+	}
+	outEval := h.Evals[0]
+	if outEval == nil || len(outEval.FailedTGAllocs) != 0 {
+		t.Fatalf("bad: %#v", outEval)
 	}
 
 	// Lookup the allocations by JobID
@@ -1230,6 +1470,74 @@ func TestBatchSched_Run_FailedAlloc(t *testing.T) {
 
 	// Ensure a replacement alloc was placed.
 	if len(out) != 2 {
+		t.Fatalf("bad: %#v", out)
+	}
+
+	h.AssertEvalStatus(t, structs.EvalStatusComplete)
+}
+
+func TestBatchSched_ReRun_SuccessfullyFinishedAlloc(t *testing.T) {
+	h := NewHarness(t)
+
+	// Create two nodes, one that is drained and has a successfully finished
+	// alloc and a fresh undrained one
+	node := mock.Node()
+	node.Drain = true
+	node2 := mock.Node()
+	noErr(t, h.State.UpsertNode(h.NextIndex(), node))
+	noErr(t, h.State.UpsertNode(h.NextIndex(), node2))
+
+	// Create a job
+	job := mock.Job()
+	job.Type = structs.JobTypeBatch
+	job.TaskGroups[0].Count = 1
+	noErr(t, h.State.UpsertJob(h.NextIndex(), job))
+
+	// Create a successful alloc
+	alloc := mock.Alloc()
+	alloc.Job = job
+	alloc.JobID = job.ID
+	alloc.NodeID = node.ID
+	alloc.Name = "my-job.web[0]"
+	alloc.ClientStatus = structs.AllocClientStatusComplete
+	alloc.TaskStates = map[string]*structs.TaskState{
+		"web": &structs.TaskState{
+			State: structs.TaskStateDead,
+			Events: []*structs.TaskEvent{
+				{
+					Type:     structs.TaskTerminated,
+					ExitCode: 0,
+				},
+			},
+		},
+	}
+	noErr(t, h.State.UpsertAllocs(h.NextIndex(), []*structs.Allocation{alloc}))
+
+	// Create a mock evaluation to rerun the job
+	eval := &structs.Evaluation{
+		ID:          structs.GenerateUUID(),
+		Priority:    job.Priority,
+		TriggeredBy: structs.EvalTriggerJobRegister,
+		JobID:       job.ID,
+	}
+
+	// Process the evaluation
+	err := h.Process(NewBatchScheduler, eval)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure no plan
+	if len(h.Plans) != 0 {
+		t.Fatalf("bad: %#v", h.Plans)
+	}
+
+	// Lookup the allocations by JobID
+	out, err := h.State.AllocsByJob(job.ID)
+	noErr(t, err)
+
+	// Ensure no replacement alloc was placed.
+	if len(out) != 1 {
 		t.Fatalf("bad: %#v", out)
 	}
 

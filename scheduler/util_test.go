@@ -12,6 +12,13 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
+// noErr is used to assert there are no errors
+func noErr(t *testing.T, err error) {
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+}
+
 func TestMaterializeTaskGroups(t *testing.T) {
 	job := mock.Job()
 	index := materializeTaskGroups(job)
@@ -67,6 +74,7 @@ func TestDiffAllocs(t *testing.T) {
 			ID:     structs.GenerateUUID(),
 			NodeID: "zip",
 			Name:   "my-job.web[10]",
+			Job:    oldJob,
 		},
 
 		// Migrate the 3rd
@@ -74,6 +82,7 @@ func TestDiffAllocs(t *testing.T) {
 			ID:     structs.GenerateUUID(),
 			NodeID: "dead",
 			Name:   "my-job.web[2]",
+			Job:    oldJob,
 		},
 	}
 
@@ -148,6 +157,7 @@ func TestDiffSystemAllocs(t *testing.T) {
 			ID:     structs.GenerateUUID(),
 			NodeID: "dead",
 			Name:   "my-job.web[0]",
+			Job:    oldJob,
 		},
 	}
 
@@ -404,6 +414,24 @@ func TestTasksUpdated(t *testing.T) {
 	if !tasksUpdated(j1.TaskGroups[0], j11.TaskGroups[0]) {
 		t.Fatalf("bad")
 	}
+
+	j12 := mock.Job()
+	j12.TaskGroups[0].Tasks[0].Resources.Networks[0].MBits = 100
+	if !tasksUpdated(j1.TaskGroups[0], j12.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
+
+	j13 := mock.Job()
+	j13.TaskGroups[0].Tasks[0].Resources.Networks[0].DynamicPorts[0].Label = "foobar"
+	if !tasksUpdated(j1.TaskGroups[0], j13.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
+
+	j14 := mock.Job()
+	j14.TaskGroups[0].Tasks[0].Resources.Networks[0].ReservedPorts = []structs.Port{{Label: "foo", Value: 1312}}
+	if !tasksUpdated(j1.TaskGroups[0], j14.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
 }
 
 func TestEvictAndPlace_LimitLessThanAllocs(t *testing.T) {
@@ -460,7 +488,7 @@ func TestSetStatus(t *testing.T) {
 	eval := mock.Eval()
 	status := "a"
 	desc := "b"
-	if err := setStatus(logger, h, eval, nil, status, desc); err != nil {
+	if err := setStatus(logger, h, eval, nil, nil, nil, status, desc); err != nil {
 		t.Fatalf("setStatus() failed: %v", err)
 	}
 
@@ -473,9 +501,10 @@ func TestSetStatus(t *testing.T) {
 		t.Fatalf("setStatus() submited invalid eval: %v", newEval)
 	}
 
+	// Test next evals
 	h = NewHarness(t)
 	next := mock.Eval()
-	if err := setStatus(logger, h, eval, next, status, desc); err != nil {
+	if err := setStatus(logger, h, eval, next, nil, nil, status, desc); err != nil {
 		t.Fatalf("setStatus() failed: %v", err)
 	}
 
@@ -486,6 +515,38 @@ func TestSetStatus(t *testing.T) {
 	newEval = h.Evals[0]
 	if newEval.NextEval != next.ID {
 		t.Fatalf("setStatus() didn't set nextEval correctly: %v", newEval)
+	}
+
+	// Test blocked evals
+	h = NewHarness(t)
+	blocked := mock.Eval()
+	if err := setStatus(logger, h, eval, nil, blocked, nil, status, desc); err != nil {
+		t.Fatalf("setStatus() failed: %v", err)
+	}
+
+	if len(h.Evals) != 1 {
+		t.Fatalf("setStatus() didn't update plan: %v", h.Evals)
+	}
+
+	newEval = h.Evals[0]
+	if newEval.BlockedEval != blocked.ID {
+		t.Fatalf("setStatus() didn't set BlockedEval correctly: %v", newEval)
+	}
+
+	// Test metrics
+	h = NewHarness(t)
+	metrics := map[string]*structs.AllocMetric{"foo": nil}
+	if err := setStatus(logger, h, eval, nil, nil, metrics, status, desc); err != nil {
+		t.Fatalf("setStatus() failed: %v", err)
+	}
+
+	if len(h.Evals) != 1 {
+		t.Fatalf("setStatus() didn't update plan: %v", h.Evals)
+	}
+
+	newEval = h.Evals[0]
+	if !reflect.DeepEqual(newEval.FailedTGAllocs, metrics) {
+		t.Fatalf("setStatus() didn't set failed task group metrics correctly: %v", newEval)
 	}
 }
 
@@ -524,9 +585,9 @@ func TestInplaceUpdate_ChangedTaskGroup(t *testing.T) {
 	stack := NewGenericStack(false, ctx)
 
 	// Do the inplace update.
-	unplaced := inplaceUpdate(ctx, eval, job, stack, updates)
+	unplaced, inplace := inplaceUpdate(ctx, eval, job, stack, updates)
 
-	if len(unplaced) != 1 {
+	if len(unplaced) != 1 || len(inplace) != 0 {
 		t.Fatal("inplaceUpdate incorrectly did an inplace update")
 	}
 
@@ -569,9 +630,9 @@ func TestInplaceUpdate_NoMatch(t *testing.T) {
 	stack := NewGenericStack(false, ctx)
 
 	// Do the inplace update.
-	unplaced := inplaceUpdate(ctx, eval, job, stack, updates)
+	unplaced, inplace := inplaceUpdate(ctx, eval, job, stack, updates)
 
-	if len(unplaced) != 1 {
+	if len(unplaced) != 1 || len(inplace) != 0 {
 		t.Fatal("inplaceUpdate incorrectly did an inplace update")
 	}
 
@@ -603,15 +664,7 @@ func TestInplaceUpdate_Success(t *testing.T) {
 		DesiredStatus: structs.AllocDesiredStatusRun,
 	}
 	alloc.TaskResources = map[string]*structs.Resources{"web": alloc.Resources}
-	alloc.PopulateServiceIDs(job.TaskGroups[0])
 	noErr(t, state.UpsertAllocs(1001, []*structs.Allocation{alloc}))
-
-	webFeSrvID := alloc.Services["web-frontend"]
-	adminSrvID := alloc.Services["web-admin"]
-
-	if webFeSrvID == "" || adminSrvID == "" {
-		t.Fatal("Service ID needs to be generated for service")
-	}
 
 	// Create a new task group that updates the resources.
 	tg := &structs.TaskGroup{}
@@ -640,9 +693,9 @@ func TestInplaceUpdate_Success(t *testing.T) {
 	stack.SetJob(job)
 
 	// Do the inplace update.
-	unplaced := inplaceUpdate(ctx, eval, job, stack, updates)
+	unplaced, inplace := inplaceUpdate(ctx, eval, job, stack, updates)
 
-	if len(unplaced) != 0 {
+	if len(unplaced) != 0 || len(inplace) != 1 {
 		t.Fatal("inplaceUpdate did not do an inplace update")
 	}
 
@@ -650,21 +703,40 @@ func TestInplaceUpdate_Success(t *testing.T) {
 		t.Fatal("inplaceUpdate did not do an inplace update")
 	}
 
+	if inplace[0].Alloc.ID != alloc.ID {
+		t.Fatalf("inplaceUpdate returned the wrong, inplace updated alloc: %#v", inplace)
+	}
+
 	// Get the alloc we inserted.
-	a := ctx.plan.NodeAllocation[alloc.NodeID][0]
-	if len(a.Services) != 3 {
-		t.Fatalf("Expected number of services: %v, Actual: %v", 3, len(a.Services))
+	a := inplace[0].Alloc // TODO(sean@): Verify this is correct vs: ctx.plan.NodeAllocation[alloc.NodeID][0]
+	if a.Job == nil {
+		t.Fatalf("bad")
 	}
 
-	// Test that the service id for the old service is still the same
-	if a.Services["web-frontend"] != webFeSrvID {
-		t.Fatalf("Expected service ID: %v, Actual: %v", webFeSrvID, a.Services["web-frontend"])
+	if len(a.Job.TaskGroups) != 1 {
+		t.Fatalf("bad")
 	}
 
-	// Test that the map doesn't contain the service ID of the admin Service
-	// anymore
-	if _, ok := a.Services["web-admin"]; ok {
-		t.Fatal("Service shouldn't be present")
+	if len(a.Job.TaskGroups[0].Tasks) != 1 {
+		t.Fatalf("bad")
+	}
+
+	if len(a.Job.TaskGroups[0].Tasks[0].Services) != 3 {
+		t.Fatalf("Expected number of services: %v, Actual: %v", 3, len(a.Job.TaskGroups[0].Tasks[0].Services))
+	}
+
+	serviceNames := make(map[string]struct{}, 3)
+	for _, consulService := range a.Job.TaskGroups[0].Tasks[0].Services {
+		serviceNames[consulService.Name] = struct{}{}
+	}
+	if len(serviceNames) != 3 {
+		t.Fatalf("bad")
+	}
+
+	for _, name := range []string{"dummy-service", "dummy-service2", "web-frontend"} {
+		if _, found := serviceNames[name]; !found {
+			t.Errorf("Expected consul service name missing: %v", name)
+		}
 	}
 }
 
@@ -759,5 +831,63 @@ func TestProgressMade(t *testing.T) {
 	alloc := &structs.PlanResult{NodeAllocation: m}
 	if !(progressMade(both) && progressMade(update) && progressMade(alloc)) {
 		t.Fatal("bad")
+	}
+}
+
+func TestDesiredUpdates(t *testing.T) {
+	tg1 := &structs.TaskGroup{Name: "foo"}
+	tg2 := &structs.TaskGroup{Name: "bar"}
+	a2 := &structs.Allocation{TaskGroup: "bar"}
+
+	place := []allocTuple{
+		allocTuple{TaskGroup: tg1},
+		allocTuple{TaskGroup: tg1},
+		allocTuple{TaskGroup: tg1},
+		allocTuple{TaskGroup: tg2},
+	}
+	stop := []allocTuple{
+		allocTuple{TaskGroup: tg2, Alloc: a2},
+		allocTuple{TaskGroup: tg2, Alloc: a2},
+	}
+	ignore := []allocTuple{
+		allocTuple{TaskGroup: tg1},
+	}
+	migrate := []allocTuple{
+		allocTuple{TaskGroup: tg2},
+	}
+	inplace := []allocTuple{
+		allocTuple{TaskGroup: tg1},
+		allocTuple{TaskGroup: tg1},
+	}
+	destructive := []allocTuple{
+		allocTuple{TaskGroup: tg1},
+		allocTuple{TaskGroup: tg2},
+		allocTuple{TaskGroup: tg2},
+	}
+	diff := &diffResult{
+		place:   place,
+		stop:    stop,
+		ignore:  ignore,
+		migrate: migrate,
+	}
+
+	expected := map[string]*structs.DesiredUpdates{
+		"foo": {
+			Place:             3,
+			Ignore:            1,
+			InPlaceUpdate:     2,
+			DestructiveUpdate: 1,
+		},
+		"bar": {
+			Place:             1,
+			Stop:              2,
+			Migrate:           1,
+			DestructiveUpdate: 2,
+		},
+	}
+
+	desired := desiredUpdates(diff, inplace, destructive)
+	if !reflect.DeepEqual(desired, expected) {
+		t.Fatalf("desiredUpdates() returned %#v; want %#v", desired, expected)
 	}
 }

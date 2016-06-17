@@ -3,11 +3,13 @@ package config
 import (
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/nomad/structs/config"
 )
 
 var (
@@ -108,6 +110,13 @@ type Config struct {
 
 	// Revision is the commit number of the Nomad client
 	Revision string
+
+	// ConsulConfig is this Agent's Consul configuration
+	ConsulConfig *config.ConsulConfig
+
+	// StatsCollectionInterval is the interval at which the Nomad client
+	// collects resource usage stats
+	StatsCollectionInterval time.Duration
 }
 
 func (c *Config) Copy() *Config {
@@ -117,6 +126,21 @@ func (c *Config) Copy() *Config {
 	nc.Servers = structs.CopySliceString(nc.Servers)
 	nc.Options = structs.CopyMapStringString(nc.Options)
 	return nc
+}
+
+// DefaultConfig returns the default configuration
+func DefaultConfig() *Config {
+	return &Config{
+		ConsulConfig: &config.ConsulConfig{
+			ServerServiceName: "nomad",
+			ClientServiceName: "nomad-client",
+			AutoAdvertise:     true,
+			Timeout:           5 * time.Second,
+		},
+		LogOutput:               os.Stderr,
+		Region:                  "global",
+		StatsCollectionInterval: 1 * time.Second,
+	}
 }
 
 // Read returns the specified configuration value or "".
@@ -157,7 +181,7 @@ func (c *Config) ReadBoolDefault(id string, defaultValue bool) bool {
 	return val
 }
 
-// ReadStringListToMap tries to parse the specified option as a comma seperated list.
+// ReadStringListToMap tries to parse the specified option as a comma separated list.
 // If there is an error in parsing, an empty list is returned.
 func (c *Config) ReadStringListToMap(key string) map[string]struct{} {
 	s := strings.TrimSpace(c.Read(key))
@@ -171,7 +195,7 @@ func (c *Config) ReadStringListToMap(key string) map[string]struct{} {
 	return list
 }
 
-// ReadStringListToMap tries to parse the specified option as a comma seperated list.
+// ReadStringListToMap tries to parse the specified option as a comma separated list.
 // If there is an error in parsing, an empty list is returned.
 func (c *Config) ReadStringListToMapDefault(key, defaultValue string) map[string]struct{} {
 	val, ok := c.Options[key]

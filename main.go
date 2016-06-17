@@ -4,8 +4,13 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/hashicorp/consul/lib"
 	"github.com/mitchellh/cli"
 )
+
+func init() {
+	lib.SeedMathRand()
+}
 
 func main() {
 	os.Exit(Run(os.Args[1:]))
@@ -35,6 +40,7 @@ func RunCustom(args []string, commands map[string]cli.CommandFactory) int {
 		case "executor":
 		case "syslog":
 		case "fs ls", "fs cat", "fs stat":
+		case "check":
 		default:
 			commandsInclude = append(commandsInclude, k)
 		}

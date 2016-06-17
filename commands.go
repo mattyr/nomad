@@ -30,7 +30,6 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
-
 		"agent": func() (cli.Command, error) {
 			return &agent.Command{
 				Revision:          GitCommit,
@@ -40,21 +39,23 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 				ShutdownCh:        make(chan struct{}),
 			}, nil
 		},
-
 		"agent-info": func() (cli.Command, error) {
 			return &command.AgentInfoCommand{
 				Meta: meta,
 			}, nil
 		},
-
+		"check": func() (cli.Command, error) {
+			return &command.AgentCheckCommand{
+				Meta: meta,
+			}, nil
+		},
 		"client-config": func() (cli.Command, error) {
 			return &command.ClientConfigCommand{
 				Meta: meta,
 			}, nil
 		},
-
-		"eval-monitor": func() (cli.Command, error) {
-			return &command.EvalMonitorCommand{
+		"eval-status": func() (cli.Command, error) {
+			return &command.EvalStatusCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -65,21 +66,6 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 		},
 		"fs": func() (cli.Command, error) {
 			return &command.FSCommand{
-				Meta: meta,
-			}, nil
-		},
-		"fs ls": func() (cli.Command, error) {
-			return &command.FSListCommand{
-				Meta: meta,
-			}, nil
-		},
-		"fs stat": func() (cli.Command, error) {
-			return &command.FSStatCommand{
-				Meta: meta,
-			}, nil
-		},
-		"fs cat": func() (cli.Command, error) {
-			return &command.FSCatCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -98,9 +84,14 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
-
 		"node-status": func() (cli.Command, error) {
 			return &command.NodeStatusCommand{
+				Meta: meta,
+			}, nil
+		},
+
+		"plan": func() (cli.Command, error) {
+			return &command.PlanCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -120,13 +111,11 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
-
 		"server-join": func() (cli.Command, error) {
 			return &command.ServerJoinCommand{
 				Meta: meta,
 			}, nil
 		},
-
 		"server-members": func() (cli.Command, error) {
 			return &command.ServerMembersCommand{
 				Meta: meta,
@@ -137,19 +126,16 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
-
 		"stop": func() (cli.Command, error) {
 			return &command.StopCommand{
 				Meta: meta,
 			}, nil
 		},
-
 		"validate": func() (cli.Command, error) {
 			return &command.ValidateCommand{
 				Meta: meta,
 			}, nil
 		},
-
 		"version": func() (cli.Command, error) {
 			ver := Version
 			rel := VersionPrerelease

@@ -8,13 +8,18 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/mitchellh/go-ps"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	cgroupFs "github.com/opencontainers/runc/libcontainer/cgroups/fs"
 	cgroupConfig "github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/runc/libcontainer/system"
 
 	"github.com/hashicorp/nomad/client/allocdir"
+	"github.com/hashicorp/nomad/client/stats"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -31,6 +36,13 @@ var (
 		"/sbin":           "/sbin",
 		"/usr":            "/usr",
 	}
+
+	// clockTicks is the clocks per second of the machine
+	clockTicks = uint64(system.GetClockTicks())
+
+	// The statistics the executor exposes when using cgroups
+	ExecutorCgroupMeasuredMemStats = []string{"RSS", "Cache", "Swap", "Max Usage", "Kernel Usage", "Kernel Max Usage"}
+	ExecutorCgroupMeasuredCpuStats = []string{"System Mode", "User Mode", "Throttled Periods", "Throttled Time", "Percent"}
 )
 
 // configureIsolation configures chroot and creates cgroups
@@ -116,6 +128,67 @@ func (e *UniversalExecutor) configureCgroups(resources *structs.Resources) error
 	return nil
 }
 
+// Stats reports the resource utilization of the cgroup. If there is no resource
+// isolation we aggregate the resource utilization of all the pids launched by
+// the executor.
+func (e *UniversalExecutor) Stats() (*cstructs.TaskResourceUsage, error) {
+	if !e.command.ResourceLimits {
+		pidStats, err := e.pidStats()
+		if err != nil {
+			return nil, err
+		}
+		return e.aggregatedResourceUsage(pidStats), nil
+	}
+	ts := time.Now()
+	manager := getCgroupManager(e.groups, e.cgPaths)
+	stats, err := manager.GetStats()
+	if err != nil {
+		return nil, err
+	}
+
+	// Memory Related Stats
+	swap := stats.MemoryStats.SwapUsage
+	maxUsage := stats.MemoryStats.Usage.MaxUsage
+	rss := stats.MemoryStats.Stats["rss"]
+	cache := stats.MemoryStats.Stats["cache"]
+	ms := &cstructs.MemoryStats{
+		RSS:            rss,
+		Cache:          cache,
+		Swap:           swap.Usage,
+		MaxUsage:       maxUsage,
+		KernelUsage:    stats.MemoryStats.KernelUsage.Usage,
+		KernelMaxUsage: stats.MemoryStats.KernelUsage.MaxUsage,
+		Measured:       ExecutorCgroupMeasuredMemStats,
+	}
+
+	// CPU Related Stats
+	totalProcessCPUUsage := float64(stats.CpuStats.CpuUsage.TotalUsage)
+	userModeTime := float64(stats.CpuStats.CpuUsage.UsageInUsermode)
+	kernelModeTime := float64(stats.CpuStats.CpuUsage.UsageInKernelmode)
+
+	totalPercent := e.totalCpuStats.Percent(totalProcessCPUUsage)
+	cs := &cstructs.CpuStats{
+		SystemMode:       e.systemCpuStats.Percent(kernelModeTime),
+		UserMode:         e.userCpuStats.Percent(userModeTime),
+		Percent:          totalPercent,
+		ThrottledPeriods: stats.CpuStats.ThrottlingData.ThrottledPeriods,
+		ThrottledTime:    stats.CpuStats.ThrottlingData.ThrottledTime,
+		TotalTicks:       e.systemCpuStats.TicksConsumed(totalPercent),
+		Measured:         ExecutorCgroupMeasuredCpuStats,
+	}
+	taskResUsage := cstructs.TaskResourceUsage{
+		ResourceUsage: &cstructs.ResourceUsage{
+			MemoryStats: ms,
+			CpuStats:    cs,
+		},
+		Timestamp: ts.UTC().UnixNano(),
+	}
+	if pidStats, err := e.pidStats(); err == nil {
+		taskResUsage.Pids = pidStats
+	}
+	return &taskResUsage, nil
+}
+
 // runAs takes a user id as a string and looks up the user, and sets the command
 // to execute as that user.
 func (e *UniversalExecutor) runAs(userid string) error {
@@ -174,6 +247,7 @@ func (e *UniversalExecutor) configureChroot() error {
 		return err
 	}
 
+	e.fsIsolationEnforced = true
 	return nil
 }
 
@@ -184,6 +258,35 @@ func (e *UniversalExecutor) removeChrootMounts() error {
 	e.cgLock.Lock()
 	defer e.cgLock.Unlock()
 	return e.ctx.AllocDir.UnmountAll()
+}
+
+// getAllPids returns the pids of all the processes spun up by the executor. We
+// use the libcontainer apis to get the pids when the user is using cgroup
+// isolation and we scan the entire process table if the user is not using any
+// isolation
+func (e *UniversalExecutor) getAllPids() (map[int]*nomadPid, error) {
+	if e.command.ResourceLimits {
+		manager := getCgroupManager(e.groups, e.cgPaths)
+		pids, err := manager.GetAllPids()
+		if err != nil {
+			return nil, err
+		}
+		np := make(map[int]*nomadPid, len(pids))
+		for _, pid := range pids {
+			np[pid] = &nomadPid{
+				pid:           pid,
+				cpuStatsTotal: stats.NewCpuStats(),
+				cpuStatsSys:   stats.NewCpuStats(),
+				cpuStatsUser:  stats.NewCpuStats(),
+			}
+		}
+		return np, nil
+	}
+	allProcesses, err := ps.Processes()
+	if err != nil {
+		return nil, err
+	}
+	return e.scanPids(os.Getpid(), allProcesses)
 }
 
 // destroyCgroup kills all processes in the cgroup and removes the cgroup

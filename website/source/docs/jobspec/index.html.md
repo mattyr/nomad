@@ -231,7 +231,7 @@ The `task` object supports the following keys:
   is available. Examples include `docker`, `qemu`, `java`, and `exec`.
 
 * `user` - Set the user that will run the task. It defaults to the same user
-  the Nomad client is being run as.
+  the Nomad client is being run as. This can only be set on Linux platforms.
 
 * `constraint` - This can be provided multiple times to define additional
   constraints. See the constraint reference for more details.
@@ -468,6 +468,35 @@ artifact {
   options {
     checksum = "md5:7f4b3e3b4dd5150d4e5aaaa5efada4c3"
   }
+}
+```
+
+#### S3 examples
+
+S3 has several different types of addressing and more detail can be found
+[here](http://docs.aws.amazon.com/AmazonS3/latest/dev/UsingBucket.html#access-bucket-intro)
+
+S3 region specific endpoints can be found
+[here](http://docs.aws.amazon.com/general/latest/gr/rande.html#s3_region)
+
+Path based style:
+```
+artifact {
+  source = "https://s3-us-west-2.amazonaws.com/my-bucket-example/my_app.tar.gz"
+}
+```
+
+or to override automatic detection in the url, use the s3 specific syntax
+```
+artifact {
+  source = "s3::https://s3-eu-west-1.amazonaws.com/my-bucket-example/my_app.tar.gz"
+}
+```
+
+Virtual hosted based style
+```
+artifact {
+  source = "my-bucket-example.s3-eu-west-1.amazonaws.com/my_app.tar.gz"
 }
 ```
 

@@ -586,6 +586,9 @@ func TestStateStore_JobsByPeriodic(t *testing.T) {
 	}
 
 	iter, err = state.JobsByPeriodic(false)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
 
 	var outNonPeriodic []*structs.Job
 	for {
@@ -1016,6 +1019,28 @@ func TestStateStore_Indexes(t *testing.T) {
 
 	if !reflect.DeepEqual(expect, out) {
 		t.Fatalf("bad: %#v %#v", expect, out)
+	}
+}
+
+func TestStateStore_LatestIndex(t *testing.T) {
+	state := testStateStore(t)
+
+	if err := state.UpsertNode(1000, mock.Node()); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	exp := uint64(2000)
+	if err := state.UpsertJob(exp, mock.Job()); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	latest, err := state.LatestIndex()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if latest != exp {
+		t.Fatalf("LatestIndex() returned %d; want %d", latest, exp)
 	}
 }
 

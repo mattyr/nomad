@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,17 +22,31 @@ import (
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver/executor"
-	cstructs "github.com/hashicorp/nomad/client/driver/structs"
+	dstructs "github.com/hashicorp/nomad/client/driver/structs"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper/discover"
 	"github.com/hashicorp/nomad/helper/fields"
+	shelpers "github.com/hashicorp/nomad/helper/stats"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/mapstructure"
 )
 
 var (
-	// We store the client globally to cache the connection to the docker daemon.
-	createClient sync.Once
-	client       *docker.Client
+	// We store the clients globally to cache the connection to the docker daemon.
+	createClients sync.Once
+
+	// client is a docker client with a timeout of 1 minute. This is for doing
+	// all operations with the docker daemon besides which are not long running
+	// such as creating, killing containers, etc.
+	client *docker.Client
+
+	// waitClient is a docker client with no timeouts. This is used for long
+	// running operations such as waiting on containers and collect stats
+	waitClient *docker.Client
+
+	// The statistics the Docker driver exposes
+	DockerMeasuredMemStats = []string{"RSS", "Cache", "Swap", "Max Usage"}
+	DockerMeasuredCpuStats = []string{"Throttled Periods", "Throttled Time", "Percent"}
 )
 
 const (
@@ -70,7 +85,7 @@ type DockerDriverConfig struct {
 	UTSMode          string              `mapstructure:"uts_mode"`           // The UTS mode of the container - host and none
 	PortMapRaw       []map[string]int    `mapstructure:"port_map"`           //
 	PortMap          map[string]int      `mapstructure:"-"`                  // A map of host port labels and the ports exposed on the container
-	Privileged       bool                `mapstructure:"privileged"`         // Flag to run the container in priviledged mode
+	Privileged       bool                `mapstructure:"privileged"`         // Flag to run the container in privileged mode
 	DNSServers       []string            `mapstructure:"dns_servers"`        // DNS Server for containers
 	DNSSearchDomains []string            `mapstructure:"dns_search_domains"` // DNS Search domains for containers
 	Hostname         string              `mapstructure:"hostname"`           // Hostname for containers
@@ -83,6 +98,7 @@ type DockerDriverConfig struct {
 	AttachStdin      bool                `mapstructure:"attach_stdin"`       // Attach to STDIN
 	AttachStdout     bool                `mapstructure:"attach_stdout"`      // Attach to STDOUT
 	AttachStderr     bool                `mapstructure:"attach_stderr"`      // Attach to STDERR
+	ShmSize          int64               `mapstructure:"shm_size"`           // Size of /dev/shm of the container in bytes
 }
 
 func (c *DockerDriverConfig) Init() error {
@@ -115,18 +131,22 @@ type dockerPID struct {
 }
 
 type DockerHandle struct {
-	pluginClient   *plugin.Client
-	executor       executor.Executor
-	client         *docker.Client
-	logger         *log.Logger
-	cleanupImage   bool
-	imageID        string
-	containerID    string
-	version        string
-	killTimeout    time.Duration
-	maxKillTimeout time.Duration
-	waitCh         chan *cstructs.WaitResult
-	doneCh         chan struct{}
+	pluginClient      *plugin.Client
+	executor          executor.Executor
+	client            *docker.Client
+	waitClient        *docker.Client
+	logger            *log.Logger
+	cleanupImage      bool
+	imageID           string
+	containerID       string
+	version           string
+	clkSpeed          float64
+	killTimeout       time.Duration
+	maxKillTimeout    time.Duration
+	resourceUsageLock sync.RWMutex
+	resourceUsage     *cstructs.TaskResourceUsage
+	waitCh            chan *dstructs.WaitResult
+	doneCh            chan bool
 }
 
 func NewDockerDriver(ctx *DriverContext) Driver {
@@ -202,6 +222,9 @@ func (d *DockerDriver) Validate(config map[string]interface{}) error {
 			"attach_stderr": &fields.FieldSchema{
 				Type: fields.TypeBool,
 			},
+			"shm_size": &fields.FieldSchema{
+				Type: fields.TypeInt,
+			},
 		},
 	}
 
@@ -212,16 +235,18 @@ func (d *DockerDriver) Validate(config map[string]interface{}) error {
 	return nil
 }
 
-// dockerClient creates *docker.Client. In test / dev mode we can use ENV vars
-// to connect to the docker daemon. In production mode we will read
-// docker.endpoint from the config file.
-func (d *DockerDriver) dockerClient() (*docker.Client, error) {
-	if client != nil {
-		return client, nil
+// dockerClients creates two *docker.Client, one for long running operations and
+// the other for shorter operations. In test / dev mode we can use ENV vars to
+// connect to the docker daemon. In production mode we will read docker.endpoint
+// from the config file.
+func (d *DockerDriver) dockerClients() (*docker.Client, *docker.Client, error) {
+	if client != nil && waitClient != nil {
+		return client, waitClient, nil
 	}
 
 	var err error
-	createClient.Do(func() {
+	var merr multierror.Error
+	createClients.Do(func() {
 		// Default to using whatever is configured in docker.endpoint. If this is
 		// not specified we'll fall back on NewClientFromEnv which reads config from
 		// the DOCKER_* environment variables DOCKER_HOST, DOCKER_TLS_VERIFY, and
@@ -246,9 +271,17 @@ func (d *DockerDriver) dockerClient() (*docker.Client, error) {
 
 		d.logger.Println("[DEBUG] driver.docker: using client connection initialized from environment")
 		client, err = docker.NewClientFromEnv()
+		if err != nil {
+			merr.Errors = append(merr.Errors, err)
+		}
 		client.HTTPClient.Timeout = dockerTimeout
+
+		waitClient, err = docker.NewClientFromEnv()
+		if err != nil {
+			merr.Errors = append(merr.Errors, err)
+		}
 	})
-	return client, err
+	return client, waitClient, merr.ErrorOrNil()
 }
 
 func (d *DockerDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
@@ -256,8 +289,8 @@ func (d *DockerDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool
 	// state changes
 	_, currentlyEnabled := node.Attributes[dockerDriverAttr]
 
-	// Initialize docker API client
-	client, err := d.dockerClient()
+	// Initialize docker API clients
+	client, _, err := d.dockerClients()
 	if err != nil {
 		delete(node.Attributes, dockerDriverAttr)
 		if currentlyEnabled {
@@ -295,11 +328,16 @@ func (d *DockerDriver) containerBinds(alloc *allocdir.AllocDir, task *structs.Ta
 		return nil, fmt.Errorf("Failed to find task local directory: %v", task.Name)
 	}
 
+	allocDirBind := fmt.Sprintf("%s:/%s", shared, allocdir.SharedAllocName)
+	taskLocalBind := fmt.Sprintf("%s:/%s", local, allocdir.TaskLocal)
+
+	if selinuxLabel := d.config.Read("docker.volumes.selinuxlabel"); selinuxLabel != "" {
+		allocDirBind = fmt.Sprintf("%s:%s", allocDirBind, selinuxLabel)
+		taskLocalBind = fmt.Sprintf("%s:%s", taskLocalBind, selinuxLabel)
+	}
 	return []string{
-		// "z" and "Z" option is to allocate directory with SELinux label.
-		fmt.Sprintf("%s:/%s:rw,z", shared, allocdir.SharedAllocName),
-		// capital "Z" will label with Multi-Category Security (MCS) labels
-		fmt.Sprintf("%s:/%s:rw,Z", local, allocdir.TaskLocal),
+		allocDirBind,
+		taskLocalBind,
 	}, nil
 }
 
@@ -368,6 +406,11 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 		return c, fmt.Errorf(`Docker privileged mode is disabled on this Nomad agent`)
 	}
 	hostConfig.Privileged = hostPrivileged
+
+	// set SHM size
+	if driverConfig.ShmSize != 0 {
+		hostConfig.ShmSize = driverConfig.ShmSize
+	}
 
 	// set DNS servers
 	for _, ip := range driverConfig.DNSServers {
@@ -492,7 +535,7 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 		d.logger.Printf("[DEBUG] driver.docker: setting container startup command to: %s", strings.Join(cmd, " "))
 		config.Cmd = cmd
 	} else if len(driverConfig.Args) != 0 {
-		d.logger.Println("[DEBUG] driver.docker: ignoring command arguments because command is not specified")
+		config.Cmd = parsedArgs
 	}
 
 	if len(driverConfig.Labels) > 0 {
@@ -525,7 +568,7 @@ func (d *DockerDriver) recoverablePullError(err error, image string) error {
 	if imageNotFoundMatcher.MatchString(err.Error()) {
 		recoverable = false
 	}
-	return cstructs.NewRecoverableError(fmt.Errorf("Failed to pull `%s`: %s", image, err), recoverable)
+	return dstructs.NewRecoverableError(fmt.Errorf("Failed to pull `%s`: %s", image, err), recoverable)
 }
 
 func (d *DockerDriver) Periodic() (bool, time.Duration) {
@@ -649,8 +692,8 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
 	}
 
-	// Initialize docker API client
-	client, err := d.dockerClient()
+	// Initialize docker API clients
+	client, waitClient, err := d.dockerClients()
 	if err != nil {
 		return nil, fmt.Errorf("Failed to connect to docker daemon: %s", err)
 	}
@@ -770,6 +813,7 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 	maxKill := d.DriverContext.config.MaxKillTimeout
 	h := &DockerHandle{
 		client:         client,
+		waitClient:     waitClient,
 		executor:       exec,
 		pluginClient:   pluginClient,
 		cleanupImage:   cleanupImage,
@@ -779,12 +823,13 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		version:        d.config.Version,
 		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
 		maxKillTimeout: maxKill,
-		doneCh:         make(chan struct{}),
-		waitCh:         make(chan *cstructs.WaitResult, 1),
+		doneCh:         make(chan bool),
+		waitCh:         make(chan *dstructs.WaitResult, 1),
 	}
 	if err := exec.SyncServices(consulContext(d.config, container.ID)); err != nil {
 		d.logger.Printf("[ERR] driver.docker: error registering services with consul for task: %q: %v", task.Name, err)
 	}
+	go h.collectStats()
 	go h.run()
 	return h, nil
 }
@@ -804,7 +849,7 @@ func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, er
 		Reattach: pid.PluginConfig.PluginConfig(),
 	}
 
-	client, err := d.dockerClient()
+	client, waitClient, err := d.dockerClients()
 	if err != nil {
 		return nil, fmt.Errorf("Failed to connect to docker daemon: %s", err)
 	}
@@ -843,6 +888,7 @@ func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, er
 	// Return a driver handle
 	h := &DockerHandle{
 		client:         client,
+		waitClient:     waitClient,
 		executor:       exec,
 		pluginClient:   pluginClient,
 		cleanupImage:   cleanupImage,
@@ -852,13 +898,14 @@ func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, er
 		version:        pid.Version,
 		killTimeout:    pid.KillTimeout,
 		maxKillTimeout: pid.MaxKillTimeout,
-		doneCh:         make(chan struct{}),
-		waitCh:         make(chan *cstructs.WaitResult, 1),
+		doneCh:         make(chan bool),
+		waitCh:         make(chan *dstructs.WaitResult, 1),
 	}
 	if err := exec.SyncServices(consulContext(d.config, pid.ContainerID)); err != nil {
 		h.logger.Printf("[ERR] driver.docker: error registering services with consul: %v", err)
 	}
 
+	go h.collectStats()
 	go h.run()
 	return h, nil
 }
@@ -884,7 +931,7 @@ func (h *DockerHandle) ContainerID() string {
 	return h.containerID
 }
 
-func (h *DockerHandle) WaitCh() chan *cstructs.WaitResult {
+func (h *DockerHandle) WaitCh() chan *dstructs.WaitResult {
 	return h.waitCh
 }
 
@@ -919,9 +966,19 @@ func (h *DockerHandle) Kill() error {
 	return nil
 }
 
+func (h *DockerHandle) Stats() (*cstructs.TaskResourceUsage, error) {
+	h.resourceUsageLock.RLock()
+	defer h.resourceUsageLock.RUnlock()
+	var err error
+	if h.resourceUsage == nil {
+		err = fmt.Errorf("stats collection hasn't started yet")
+	}
+	return h.resourceUsage, err
+}
+
 func (h *DockerHandle) run() {
 	// Wait for it...
-	exitCode, err := h.client.WaitContainer(h.containerID)
+	exitCode, err := h.waitClient.WaitContainer(h.containerID)
 	if err != nil {
 		h.logger.Printf("[ERR] driver.docker: failed to wait for %s; container already terminated", h.containerID)
 	}
@@ -931,7 +988,7 @@ func (h *DockerHandle) run() {
 	}
 
 	close(h.doneCh)
-	h.waitCh <- cstructs.NewWaitResult(exitCode, 0, err)
+	h.waitCh <- dstructs.NewWaitResult(exitCode, 0, err)
 	close(h.waitCh)
 
 	// Remove services
@@ -966,4 +1023,72 @@ func (h *DockerHandle) run() {
 			h.logger.Printf("[DEBUG] driver.docker: error removing image: %v", err)
 		}
 	}
+}
+
+// collectStats starts collecting resource usage stats of a docker container
+func (h *DockerHandle) collectStats() {
+	statsCh := make(chan *docker.Stats)
+	statsOpts := docker.StatsOptions{ID: h.containerID, Done: h.doneCh, Stats: statsCh, Stream: true}
+	go func() {
+		//TODO handle Stats error
+		if err := h.waitClient.Stats(statsOpts); err != nil {
+			h.logger.Printf("[DEBUG] driver.docker: error collecting stats from container %s: %v", h.containerID, err)
+		}
+	}()
+	numCores := runtime.NumCPU()
+	for {
+		select {
+		case s := <-statsCh:
+			if s != nil {
+				ms := &cstructs.MemoryStats{
+					RSS:      s.MemoryStats.Stats.Rss,
+					Cache:    s.MemoryStats.Stats.Cache,
+					Swap:     s.MemoryStats.Stats.Swap,
+					MaxUsage: s.MemoryStats.MaxUsage,
+					Measured: DockerMeasuredMemStats,
+				}
+
+				cs := &cstructs.CpuStats{
+					ThrottledPeriods: s.CPUStats.ThrottlingData.ThrottledPeriods,
+					ThrottledTime:    s.CPUStats.ThrottlingData.ThrottledTime,
+					Measured:         DockerMeasuredCpuStats,
+				}
+
+				// Calculate percentage
+				cores := len(s.CPUStats.CPUUsage.PercpuUsage)
+				cs.Percent = calculatePercent(
+					s.CPUStats.CPUUsage.TotalUsage, s.PreCPUStats.CPUUsage.TotalUsage,
+					s.CPUStats.SystemCPUUsage, s.PreCPUStats.SystemCPUUsage, cores)
+				cs.SystemMode = calculatePercent(
+					s.CPUStats.CPUUsage.UsageInKernelmode, s.PreCPUStats.CPUUsage.UsageInKernelmode,
+					s.CPUStats.CPUUsage.TotalUsage, s.PreCPUStats.CPUUsage.TotalUsage, cores)
+				cs.UserMode = calculatePercent(
+					s.CPUStats.CPUUsage.UsageInUsermode, s.PreCPUStats.CPUUsage.UsageInUsermode,
+					s.CPUStats.CPUUsage.TotalUsage, s.PreCPUStats.CPUUsage.TotalUsage, cores)
+				cs.TotalTicks = (cs.Percent / 100) * shelpers.TotalTicksAvailable() / float64(numCores)
+
+				h.resourceUsageLock.Lock()
+				h.resourceUsage = &cstructs.TaskResourceUsage{
+					ResourceUsage: &cstructs.ResourceUsage{
+						MemoryStats: ms,
+						CpuStats:    cs,
+					},
+					Timestamp: s.Read.UTC().UnixNano(),
+				}
+				h.resourceUsageLock.Unlock()
+			}
+		case <-h.doneCh:
+			return
+		}
+	}
+}
+
+func calculatePercent(newSample, oldSample, newTotal, oldTotal uint64, cores int) float64 {
+	numerator := newSample - oldSample
+	denom := newTotal - oldTotal
+	if numerator <= 0 || denom <= 0 {
+		return 0.0
+	}
+
+	return (float64(numerator) / float64(denom)) * float64(cores) * 100.0
 }

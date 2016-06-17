@@ -14,6 +14,7 @@ import (
 
 	client "github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/nomad"
+	"github.com/hashicorp/nomad/nomad/structs/config"
 )
 
 // Config is the configuration for the Nomad agent.
@@ -81,6 +82,11 @@ type Config struct {
 
 	// AtlasConfig is used to configure Atlas
 	Atlas *AtlasConfig `mapstructure:"atlas"`
+
+	// Consul contains the configuration for the Consul Agent and
+	// parameters necessary to register services, their checks, and
+	// discover the current Nomad servers.
+	Consul *config.ConsulConfig `mapstructure:"consul"`
 
 	// NomadConfig is used to override the default config.
 	// This is largly used for testing purposes.
@@ -179,7 +185,7 @@ type ServerConfig struct {
 	Enabled bool `mapstructure:"enabled"`
 
 	// BootstrapExpect tries to automatically bootstrap the Consul cluster,
-	// by witholding peers until enough servers join.
+	// by withholding peers until enough servers join.
 	BootstrapExpect int `mapstructure:"bootstrap_expect"`
 
 	// DataDir is the directory to store our state in
@@ -234,9 +240,11 @@ type ServerConfig struct {
 
 // Telemetry is the telemetry configuration for the server
 type Telemetry struct {
-	StatsiteAddr    string `mapstructure:"statsite_address"`
-	StatsdAddr      string `mapstructure:"statsd_address"`
-	DisableHostname bool   `mapstructure:"disable_hostname"`
+	StatsiteAddr       string        `mapstructure:"statsite_address"`
+	StatsdAddr         string        `mapstructure:"statsd_address"`
+	DisableHostname    bool          `mapstructure:"disable_hostname"`
+	CollectionInterval string        `mapstructure:"collection_interval"`
+	collectionInterval time.Duration `mapstructure:"-"`
 }
 
 // Ports is used to encapsulate the various ports we bind to for network
@@ -341,6 +349,7 @@ func DevConfig() *Config {
 	conf.DevMode = true
 	conf.EnableDebug = true
 	conf.DisableAnonymousSignature = true
+	conf.Consul.AutoAdvertise = true
 	if runtime.GOOS == "darwin" {
 		conf.Client.NetworkInterface = "lo0"
 	} else if runtime.GOOS == "linux" {
@@ -368,6 +377,14 @@ func DefaultConfig() *Config {
 		Addresses:      &Addresses{},
 		AdvertiseAddrs: &AdvertiseAddrs{},
 		Atlas:          &AtlasConfig{},
+		Consul: &config.ConsulConfig{
+			ServerServiceName: "nomad",
+			ClientServiceName: "nomad-client",
+			AutoAdvertise:     true,
+			ServerAutoJoin:    true,
+			ClientAutoJoin:    true,
+			Timeout:           5 * time.Second,
+		},
 		Client: &ClientConfig{
 			Enabled:        false,
 			NetworkSpeed:   100,
@@ -384,6 +401,10 @@ func DefaultConfig() *Config {
 			RetryMaxAttempts: 0,
 		},
 		SyslogFacility: "LOCAL0",
+		Telemetry: &Telemetry{
+			CollectionInterval: "1s",
+			collectionInterval: 1 * time.Second,
+		},
 	}
 }
 
@@ -512,8 +533,24 @@ func (c *Config) Merge(b *Config) *Config {
 		result.Atlas = result.Atlas.Merge(b.Atlas)
 	}
 
+	// Apply the Consul Configuration
+	if result.Consul == nil && b.Consul != nil {
+		consulConfig := *b.Consul
+		result.Consul = &consulConfig
+	} else if b.Consul != nil {
+		result.Consul = result.Consul.Merge(b.Consul)
+	}
+
 	// Merge config files lists
 	result.Files = append(result.Files, b.Files...)
+
+	// Add the http API response header map values
+	if result.HTTPAPIResponseHeaders == nil {
+		result.HTTPAPIResponseHeaders = make(map[string]string)
+	}
+	for k, v := range b.HTTPAPIResponseHeaders {
+		result.HTTPAPIResponseHeaders[k] = v
+	}
 
 	return &result
 }
@@ -639,6 +676,12 @@ func (a *Telemetry) Merge(b *Telemetry) *Telemetry {
 	}
 	if b.DisableHostname {
 		result.DisableHostname = true
+	}
+	if b.CollectionInterval != "" {
+		result.CollectionInterval = b.CollectionInterval
+	}
+	if b.collectionInterval != 0 {
+		result.collectionInterval = b.collectionInterval
 	}
 	return &result
 }

@@ -6,6 +6,8 @@ data_dir = "/tmp/client1"
 
 enable_debug = true
 
+name = "client1"
+
 # Enable the client
 client {
     enabled = true
@@ -17,6 +19,9 @@ client {
     node_class = "foo"
     options {
         "driver.raw_exec.enable" = "1"
+    }
+    reserved {
+       cpu = 500
     }
 }
 

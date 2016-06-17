@@ -248,6 +248,118 @@ func TestJobEndpoint_Register_Periodic(t *testing.T) {
 	}
 }
 
+func TestJobEndpoint_Register_EnforceIndex(t *testing.T) {
+	s1 := testServer(t, func(c *Config) {
+		c.NumSchedulers = 0 // Prevent automatic dequeue
+	})
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request and enforcing an incorrect index
+	job := mock.Job()
+	req := &structs.JobRegisterRequest{
+		Job:            job,
+		EnforceIndex:   true,
+		JobModifyIndex: 100, // Not registered yet so not possible
+		WriteRequest:   structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.JobRegisterResponse
+	err := msgpackrpc.CallWithCodec(codec, "Job.Register", req, &resp)
+	if err == nil || !strings.Contains(err.Error(), RegisterEnforceIndexErrPrefix) {
+		t.Fatalf("expected enforcement error")
+	}
+
+	// Create the register request and enforcing it is new
+	req = &structs.JobRegisterRequest{
+		Job:            job,
+		EnforceIndex:   true,
+		JobModifyIndex: 0,
+		WriteRequest:   structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	if err := msgpackrpc.CallWithCodec(codec, "Job.Register", req, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp.Index == 0 {
+		t.Fatalf("bad index: %d", resp.Index)
+	}
+
+	curIndex := resp.JobModifyIndex
+
+	// Check for the node in the FSM
+	state := s1.fsm.State()
+	out, err := state.JobByID(job.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out == nil {
+		t.Fatalf("expected job")
+	}
+	if out.CreateIndex != resp.JobModifyIndex {
+		t.Fatalf("index mis-match")
+	}
+
+	// Reregister request and enforcing it be a new job
+	req = &structs.JobRegisterRequest{
+		Job:            job,
+		EnforceIndex:   true,
+		JobModifyIndex: 0,
+		WriteRequest:   structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	err = msgpackrpc.CallWithCodec(codec, "Job.Register", req, &resp)
+	if err == nil || !strings.Contains(err.Error(), RegisterEnforceIndexErrPrefix) {
+		t.Fatalf("expected enforcement error")
+	}
+
+	// Reregister request and enforcing it be at an incorrect index
+	req = &structs.JobRegisterRequest{
+		Job:            job,
+		EnforceIndex:   true,
+		JobModifyIndex: curIndex - 1,
+		WriteRequest:   structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	err = msgpackrpc.CallWithCodec(codec, "Job.Register", req, &resp)
+	if err == nil || !strings.Contains(err.Error(), RegisterEnforceIndexErrPrefix) {
+		t.Fatalf("expected enforcement error")
+	}
+
+	// Reregister request and enforcing it be at the correct index
+	job.Priority = job.Priority + 1
+	req = &structs.JobRegisterRequest{
+		Job:            job,
+		EnforceIndex:   true,
+		JobModifyIndex: curIndex,
+		WriteRequest:   structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	if err := msgpackrpc.CallWithCodec(codec, "Job.Register", req, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp.Index == 0 {
+		t.Fatalf("bad index: %d", resp.Index)
+	}
+
+	out, err = state.JobByID(job.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out == nil {
+		t.Fatalf("expected job")
+	}
+	if out.Priority != job.Priority {
+		t.Fatalf("priority mis-match")
+	}
+}
+
 func TestJobEndpoint_Evaluate(t *testing.T) {
 	s1 := testServer(t, func(c *Config) {
 		c.NumSchedulers = 0 // Prevent automatic dequeue
@@ -912,5 +1024,109 @@ func TestJobEndpoint_Evaluations(t *testing.T) {
 
 	if len(resp2.Evaluations) != 2 {
 		t.Fatalf("bad: %#v", resp2.Evaluations)
+	}
+}
+
+func TestJobEndpoint_Plan_WithDiff(t *testing.T) {
+	s1 := testServer(t, func(c *Config) {
+		c.NumSchedulers = 0 // Prevent automatic dequeue
+	})
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	job := mock.Job()
+	req := &structs.JobRegisterRequest{
+		Job:          job,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.JobRegisterResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Job.Register", req, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp.Index == 0 {
+		t.Fatalf("bad index: %d", resp.Index)
+	}
+
+	// Create a plan request
+	planReq := &structs.JobPlanRequest{
+		Job:          job,
+		Diff:         true,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var planResp structs.JobPlanResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Job.Plan", planReq, &planResp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Check the response
+	if planResp.JobModifyIndex == 0 {
+		t.Fatalf("bad cas: %d", planResp.JobModifyIndex)
+	}
+	if planResp.Annotations == nil {
+		t.Fatalf("no annotations")
+	}
+	if planResp.Diff == nil {
+		t.Fatalf("no diff")
+	}
+	if len(planResp.FailedTGAllocs) == 0 {
+		t.Fatalf("no failed task group alloc metrics")
+	}
+}
+
+func TestJobEndpoint_Plan_NoDiff(t *testing.T) {
+	s1 := testServer(t, func(c *Config) {
+		c.NumSchedulers = 0 // Prevent automatic dequeue
+	})
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	job := mock.Job()
+	req := &structs.JobRegisterRequest{
+		Job:          job,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.JobRegisterResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Job.Register", req, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp.Index == 0 {
+		t.Fatalf("bad index: %d", resp.Index)
+	}
+
+	// Create a plan request
+	planReq := &structs.JobPlanRequest{
+		Job:          job,
+		Diff:         false,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var planResp structs.JobPlanResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Job.Plan", planReq, &planResp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Check the response
+	if planResp.JobModifyIndex == 0 {
+		t.Fatalf("bad cas: %d", planResp.JobModifyIndex)
+	}
+	if planResp.Annotations == nil {
+		t.Fatalf("no annotations")
+	}
+	if planResp.Diff != nil {
+		t.Fatalf("got diff")
+	}
+	if len(planResp.FailedTGAllocs) == 0 {
+		t.Fatalf("no failed task group alloc metrics")
 	}
 }
