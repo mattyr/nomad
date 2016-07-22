@@ -33,6 +33,7 @@ const (
 	AllocSnapshot
 	TimeTableSnapshot
 	PeriodicLaunchSnapshot
+	JobSummarySnapshot
 )
 
 // nomadFSM implements a finite state machine that is used
@@ -225,6 +226,13 @@ func (n *nomadFSM) applyUpsertJob(buf []byte, index uint64) interface{} {
 	if err := structs.Decode(buf, &req); err != nil {
 		panic(fmt.Errorf("failed to decode request: %v", err))
 	}
+
+	// COMPAT: Remove in 0.5
+	// Empty maps and slices should be treated as nil to avoid
+	// un-intended destructive updates in scheduler since we use
+	// reflect.DeepEqual. Starting Nomad 0.4.1, job submission sanatizes
+	// the incoming job.
+	req.Job.Canonicalize()
 
 	if err := n.state.UpsertJob(index, req.Job); err != nil {
 		n.logger.Printf("[ERR] nomad.fsm: UpsertJob failed: %v", err)
@@ -499,6 +507,14 @@ func (n *nomadFSM) Restore(old io.ReadCloser) error {
 			if err := dec.Decode(job); err != nil {
 				return err
 			}
+
+			// COMPAT: Remove in 0.5
+			// Empty maps and slices should be treated as nil to avoid
+			// un-intended destructive updates in scheduler since we use
+			// reflect.DeepEqual. Starting Nomad 0.4.1, job submission sanatizes
+			// the incoming job.
+			job.Canonicalize()
+
 			if err := restore.JobRestore(job); err != nil {
 				return err
 			}
@@ -536,6 +552,15 @@ func (n *nomadFSM) Restore(old io.ReadCloser) error {
 				return err
 			}
 			if err := restore.PeriodicLaunchRestore(launch); err != nil {
+				return err
+			}
+
+		case JobSummarySnapshot:
+			summary := new(structs.JobSummary)
+			if err := dec.Decode(summary); err != nil {
+				return err
+			}
+			if err := restore.JobSummaryRestore(summary); err != nil {
 				return err
 			}
 
@@ -590,6 +615,10 @@ func (s *nomadSnapshot) Persist(sink raft.SnapshotSink) error {
 		return err
 	}
 	if err := s.persistPeriodicLaunches(sink, encoder); err != nil {
+		sink.Cancel()
+		return err
+	}
+	if err := s.persistJobSummaries(sink, encoder); err != nil {
 		sink.Cancel()
 		return err
 	}
@@ -752,6 +781,30 @@ func (s *nomadSnapshot) persistPeriodicLaunches(sink raft.SnapshotSink,
 		// Write out a job registration
 		sink.Write([]byte{byte(PeriodicLaunchSnapshot)})
 		if err := encoder.Encode(launch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *nomadSnapshot) persistJobSummaries(sink raft.SnapshotSink,
+	encoder *codec.Encoder) error {
+
+	summaries, err := s.snap.JobSummaries()
+	if err != nil {
+		return err
+	}
+
+	for {
+		raw := summaries.Next()
+		if raw == nil {
+			break
+		}
+
+		jobSummary := raw.(*structs.JobSummary)
+
+		sink.Write([]byte{byte(JobSummarySnapshot)})
+		if err := encoder.Encode(jobSummary); err != nil {
 			return err
 		}
 	}

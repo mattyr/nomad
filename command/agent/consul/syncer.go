@@ -25,11 +25,11 @@
 package consul
 
 import (
-	"crypto/tls"
 	"fmt"
 	"log"
-	"net/http"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +38,6 @@ import (
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/go-multierror"
 
-	cconfig "github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/hashicorp/nomad/nomad/types"
@@ -153,66 +152,19 @@ type Syncer struct {
 
 // NewSyncer returns a new consul.Syncer
 func NewSyncer(consulConfig *config.ConsulConfig, shutdownCh chan struct{}, logger *log.Logger) (*Syncer, error) {
+	var consulClientConfig *consul.Config
 	var err error
-	var c *consul.Client
-
-	cfg := consul.DefaultConfig()
-
-	// If a nil consulConfig was provided, fall back to the default config
-	if consulConfig == nil {
-		consulConfig = cconfig.DefaultConfig().ConsulConfig
+	consulClientConfig, err = consulConfig.ApiConfig()
+	if err != nil {
+		return nil, err
 	}
 
-	if consulConfig.Addr != "" {
-		cfg.Address = consulConfig.Addr
-	}
-	if consulConfig.Token != "" {
-		cfg.Token = consulConfig.Token
-	}
-	if consulConfig.Auth != "" {
-		var username, password string
-		if strings.Contains(consulConfig.Auth, ":") {
-			split := strings.SplitN(consulConfig.Auth, ":", 2)
-			username = split[0]
-			password = split[1]
-		} else {
-			username = consulConfig.Auth
-		}
-
-		cfg.HttpAuth = &consul.HttpBasicAuth{
-			Username: username,
-			Password: password,
-		}
-	}
-	if consulConfig.EnableSSL {
-		cfg.Scheme = "https"
-		tlsCfg := consul.TLSConfig{
-			Address:            cfg.Address,
-			CAFile:             consulConfig.CAFile,
-			CertFile:           consulConfig.CertFile,
-			KeyFile:            consulConfig.KeyFile,
-			InsecureSkipVerify: !consulConfig.VerifySSL,
-		}
-		tlsClientCfg, err := consul.SetupTLSConfig(&tlsCfg)
-		if err != nil {
-			return nil, fmt.Errorf("error creating tls client config for consul: %v", err)
-		}
-		cfg.HttpClient.Transport = &http.Transport{
-			TLSClientConfig: tlsClientCfg,
-		}
-	}
-	if consulConfig.EnableSSL && !consulConfig.VerifySSL {
-		cfg.HttpClient.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		}
-	}
-	if c, err = consul.NewClient(cfg); err != nil {
+	var consulClient *consul.Client
+	if consulClient, err = consul.NewClient(consulClientConfig); err != nil {
 		return nil, err
 	}
 	consulSyncer := Syncer{
-		client:            c,
+		client:            consulClient,
 		logger:            logger,
 		consulAvailable:   true,
 		shutdownCh:        shutdownCh,
@@ -734,14 +686,18 @@ func (c *Syncer) registerCheck(chkReg *consul.AgentCheckRegistration) error {
 
 // createCheckReg creates a Check that can be registered with Nomad. It also
 // creates a Nomad check for the check types that it can handle.
-func (c *Syncer) createCheckReg(check *structs.ServiceCheck, service *consul.AgentServiceRegistration) (*consul.AgentCheckRegistration, error) {
+func (c *Syncer) createCheckReg(check *structs.ServiceCheck, serviceReg *consul.AgentServiceRegistration) (*consul.AgentCheckRegistration, error) {
 	chkReg := consul.AgentCheckRegistration{
-		ID:        check.Hash(service.ID),
+		ID:        check.Hash(serviceReg.ID),
 		Name:      check.Name,
-		ServiceID: service.ID,
+		ServiceID: serviceReg.ID,
 	}
 	chkReg.Timeout = check.Timeout.String()
 	chkReg.Interval = check.Interval.String()
+	host, port := serviceReg.Address, serviceReg.Port
+	if check.PortLabel != "" {
+		host, port = c.addrFinder(check.PortLabel)
+	}
 	switch check.Type {
 	case structs.ServiceCheckHTTP:
 		if check.Protocol == "" {
@@ -749,12 +705,12 @@ func (c *Syncer) createCheckReg(check *structs.ServiceCheck, service *consul.Age
 		}
 		url := url.URL{
 			Scheme: check.Protocol,
-			Host:   fmt.Sprintf("%s:%d", service.Address, service.Port),
+			Host:   net.JoinHostPort(host, strconv.Itoa(port)),
 			Path:   check.Path,
 		}
 		chkReg.HTTP = url.String()
 	case structs.ServiceCheckTCP:
-		chkReg.TCP = fmt.Sprintf("%s:%d", service.Address, service.Port)
+		chkReg.TCP = net.JoinHostPort(host, strconv.Itoa(port))
 	case structs.ServiceCheckScript:
 		chkReg.TTL = (check.Interval + ttlCheckBuffer).String()
 	default:

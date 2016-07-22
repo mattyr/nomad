@@ -99,8 +99,8 @@ ring using the [`server-members`](/docs/commands/server-members.html) command:
 
 ```text
 $ nomad server-members
-Name          Address    Port  Status  Protocol  Build     Datacenter  Region
-nomad.global  127.0.0.1  4648  alive   2         0.3.0dev  dc1         global
+Name          Address    Port  Status  Leader  Protocol  Build     Datacenter  Region
+nomad.global  127.0.0.1  4648  alive   true    2         0.4.0rc2  dc1         global
 ```
 
 The output shows our own agent, the address it is running on, its
@@ -144,4 +144,4 @@ be used to force the server from a _failed_ to a _left_ state.
 
 ## Next Steps
 
-The development Nomad agent is up and running. Let's try to [run a job](jobs.html)!
+If you shut down the development Nomad agent as instructed above, ensure that it is back up and running again and let's try to [run a job](jobs.html)!

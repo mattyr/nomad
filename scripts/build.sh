@@ -17,7 +17,7 @@ GIT_DIRTY="$(test -n "`git status --porcelain`" && echo "+CHANGES" || true)"
 
 # Determine the arch/os combos we're building for
 XC_ARCH=${XC_ARCH:-"386 amd64 arm"}
-XC_OS=${XC_OS:-darwin dragonfly freebsd linux netbsd openbsd solaris windows}
+XC_OS=${XC_OS:-darwin windows linux}
 
 # Delete the old dir
 echo "==> Removing old directory..."
@@ -36,7 +36,6 @@ echo "==> Building..."
 gox \
     -os="${XC_OS}" \
     -os="!dragonfly" \
-    -os="!freebsd" \
     -os="!netbsd" \
     -os="!openbsd" \
     -os="!solaris" \

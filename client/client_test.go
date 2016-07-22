@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,7 +23,13 @@ import (
 	ctestutil "github.com/hashicorp/nomad/client/testutil"
 )
 
-var nextPort uint32 = 16000
+var (
+	nextPort uint32 = 16000
+
+	osExecDriverSupport = map[string]bool{
+		"linux": true,
+	}
+)
 
 func getPort() int {
 	return int(atomic.AddUint32(&nextPort, 1))
@@ -61,13 +68,14 @@ func testServer(t *testing.T, cb func(*nomad.Config)) (*nomad.Server, string) {
 	}
 
 	shutdownCh := make(chan struct{})
-	consulSyncer, err := consul.NewSyncer(config.ConsulConfig, shutdownCh, log.New(os.Stderr, "", log.LstdFlags))
+	logger := log.New(config.LogOutput, "", log.LstdFlags)
+	consulSyncer, err := consul.NewSyncer(config.ConsulConfig, shutdownCh, logger)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	// Create server
-	server, err := nomad.NewServer(config, consulSyncer)
+	server, err := nomad.NewServer(config, consulSyncer, logger)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -87,7 +95,8 @@ func testClient(t *testing.T, cb func(c *config.Config)) *Client {
 		t.Fatalf("err: %v", err)
 	}
 
-	client, err := NewClient(conf, consulSyncer)
+	logger := log.New(conf.LogOutput, "", log.LstdFlags)
+	client, err := NewClient(conf, consulSyncer, logger)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -223,7 +232,11 @@ func TestClient_Drivers(t *testing.T) {
 
 	node := c.Node()
 	if node.Attributes["driver.exec"] == "" {
-		t.Fatalf("missing exec driver")
+		if v, ok := osExecDriverSupport[runtime.GOOS]; v && ok {
+			t.Fatalf("missing exec driver")
+		} else {
+			t.Skipf("missing exec driver, no OS support")
+		}
 	}
 }
 
@@ -240,7 +253,11 @@ func TestClient_Drivers_InWhitelist(t *testing.T) {
 
 	node := c.Node()
 	if node.Attributes["driver.exec"] == "" {
-		t.Fatalf("missing exec driver")
+		if v, ok := osExecDriverSupport[runtime.GOOS]; v && ok {
+			t.Fatalf("missing exec driver")
+		} else {
+			t.Skipf("missing exec driver, no OS support")
+		}
 	}
 }
 
@@ -475,12 +492,13 @@ func TestClient_SaveRestoreState(t *testing.T) {
 
 	// Create a new client
 	shutdownCh := make(chan struct{})
-	consulSyncer, err := consul.NewSyncer(c1.config.ConsulConfig, shutdownCh, log.New(os.Stderr, "", log.LstdFlags))
+	logger := log.New(c1.config.LogOutput, "", log.LstdFlags)
+	consulSyncer, err := consul.NewSyncer(c1.config.ConsulConfig, shutdownCh, logger)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	c2, err := NewClient(c1.config, consulSyncer)
+	c2, err := NewClient(c1.config, consulSyncer, logger)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}

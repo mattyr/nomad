@@ -43,15 +43,14 @@ The following options are available for use in the job specification.
 
 * `command` - (Optional) The command to run when starting the container.
 
-*   `args` - (Optional) A list of arguments to the optional `command`. If no
-    `command` is present, `args` are ignored. References to environment variables
-    or any [interpretable Nomad
-    variables](/docs/jobspec/interpreted.html) will be interpreted
-    before launching the task. For example:
+* `args` - (Optional) A list of arguments to the optional `command`. If no
+  `command` is present, `args` are ignored. References to environment variables
+  or any [interpretable Nomad variables](/docs/jobspec/interpreted.html) will be
+  interpreted before launching the task. For example:
 
-    ```
-        args = ["${nomad.datacenter}", "${MY_ENV}", "${meta.foo}"]
-    ```
+  ```
+  args = ["${nomad.datacenter}", "${MY_ENV}", "${meta.foo}"]
+  ```
 
 * `labels` - (Optional) A key/value map of labels to set to the containers on
   start.
@@ -94,7 +93,7 @@ The following options are available for use in the job specification.
   to use.
 
 * `SSL` - (Optional) If this is set to true, Nomad uses SSL to talk to the
-  repository. The default value is `false`.
+  repository. The default value is `true`.
 
 * `port_map` - (Optional) A key/value map of port labels (see below).
 
@@ -130,7 +129,7 @@ The `auth` object supports the following keys:
 
 * `email` - (Optional) The account email.
 
-* `server_address` - (Optional) The server domain/ip without the protocol.
+* `server_address` - (Optional) The server domain/IP without the protocol.
   Docker Hub is used by default.
 
 Example:
@@ -172,8 +171,12 @@ You can allocate ports to your task using the port syntax described on the
 task "webservice" {
     driver = "docker"
 
-    port "http" {}
-    port "https" {}
+    resources {
+        network {
+            port "http" {}
+            port "https" {}
+        }
+    }
 }
 ```
 
@@ -256,7 +259,7 @@ socket. Nomad will need to be able to read/write to this socket. If you do not
 run Nomad as root, make sure you add the Nomad user to the Docker group so
 Nomad can communicate with the Docker daemon.
 
-For example, on ubuntu you can use the `usermod` command to add the `vagrant`
+For example, on Ubuntu you can use the `usermod` command to add the `vagrant`
 user to the `docker` group so you can run Nomad without root:
 
     sudo usermod -G docker -a vagrant
@@ -305,14 +308,10 @@ options](/docs/agent/config.html#options):
   set to `host`, which gives access to the hosts ipc, pid and UTS namespaces
   respectively.  
 
-    cert := d.config.Read("docker.tls.cert")
-    key := d.config.Read("docker.tls.key")
-    ca := d.config.Read("docker.tls.ca")
-
 Note: When testing or using the `-dev` flag you can use `DOCKER_HOST`,
 `DOCKER_TLS_VERIFY`, and `DOCKER_CERT_PATH` to customize Nomad's behavior. If
 `docker.endpoint` is set Nomad will **only** read client configuration from the
-config filie.
+config file.
 
 An example is given below: 
 

@@ -26,7 +26,7 @@ func TestCoreScheduler_EvalGC(t *testing.T) {
 	// Insert "dead" alloc
 	alloc := mock.Alloc()
 	alloc.EvalID = eval.ID
-	alloc.DesiredStatus = structs.AllocDesiredStatusFailed
+	alloc.DesiredStatus = structs.AllocDesiredStatusStop
 	err = state.UpsertAllocs(1001, []*structs.Allocation{alloc})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -44,8 +44,7 @@ func TestCoreScheduler_EvalGC(t *testing.T) {
 	core := NewCoreScheduler(s1, snap)
 
 	// Attempt the GC
-	gc := s1.coreJobEval(structs.CoreJobEvalGC)
-	gc.ModifyIndex = 2000
+	gc := s1.coreJobEval(structs.CoreJobEvalGC, 2000)
 	err = core.Process(gc)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -69,6 +68,86 @@ func TestCoreScheduler_EvalGC(t *testing.T) {
 	}
 }
 
+// An EvalGC should never reap a batch job
+func TestCoreScheduler_EvalGC_Batch(t *testing.T) {
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Insert a "dead" job
+	state := s1.fsm.State()
+	job := mock.Job()
+	job.Type = structs.JobTypeBatch
+	job.Status = structs.JobStatusDead
+	err := state.UpsertJob(1000, job)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Insert "complete" eval
+	eval := mock.Eval()
+	eval.Status = structs.EvalStatusComplete
+	eval.Type = structs.JobTypeBatch
+	eval.JobID = job.ID
+	err = state.UpsertEvals(1001, []*structs.Evaluation{eval})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Insert "failed" alloc
+	alloc := mock.Alloc()
+	alloc.JobID = job.ID
+	alloc.EvalID = eval.ID
+	alloc.DesiredStatus = structs.AllocDesiredStatusStop
+	err = state.UpsertAllocs(1002, []*structs.Allocation{alloc})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Update the time tables to make this work
+	tt := s1.fsm.TimeTable()
+	tt.Witness(2000, time.Now().UTC().Add(-1*s1.config.EvalGCThreshold))
+
+	// Create a core scheduler
+	snap, err := state.Snapshot()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	core := NewCoreScheduler(s1, snap)
+
+	// Attempt the GC
+	gc := s1.coreJobEval(structs.CoreJobEvalGC, 2000)
+	err = core.Process(gc)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Nothing should be gone
+	out, err := state.EvalByID(eval.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out == nil {
+		t.Fatalf("bad: %v", out)
+	}
+
+	outA, err := state.AllocByID(alloc.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if outA == nil {
+		t.Fatalf("bad: %v", outA)
+	}
+
+	outB, err := state.JobByID(job.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if outB == nil {
+		t.Fatalf("bad: %v", outB)
+	}
+}
+
 func TestCoreScheduler_EvalGC_Partial(t *testing.T) {
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
@@ -86,7 +165,7 @@ func TestCoreScheduler_EvalGC_Partial(t *testing.T) {
 	// Insert "dead" alloc
 	alloc := mock.Alloc()
 	alloc.EvalID = eval.ID
-	alloc.DesiredStatus = structs.AllocDesiredStatusFailed
+	alloc.DesiredStatus = structs.AllocDesiredStatusStop
 	err = state.UpsertAllocs(1001, []*structs.Allocation{alloc})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -112,8 +191,7 @@ func TestCoreScheduler_EvalGC_Partial(t *testing.T) {
 	core := NewCoreScheduler(s1, snap)
 
 	// Attempt the GC
-	gc := s1.coreJobEval(structs.CoreJobEvalGC)
-	gc.ModifyIndex = 2000
+	gc := s1.coreJobEval(structs.CoreJobEvalGC, 2000)
 	err = core.Process(gc)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -146,173 +224,6 @@ func TestCoreScheduler_EvalGC_Partial(t *testing.T) {
 	}
 }
 
-func TestCoreScheduler_EvalGC_Batch_NoAllocs(t *testing.T) {
-	s1 := testServer(t, nil)
-	defer s1.Shutdown()
-	testutil.WaitForLeader(t, s1.RPC)
-
-	// Insert "dead" eval
-	state := s1.fsm.State()
-	eval := mock.Eval()
-	eval.Type = structs.JobTypeBatch
-	eval.Status = structs.EvalStatusFailed
-	err := state.UpsertEvals(1000, []*structs.Evaluation{eval})
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Update the time tables to make this work
-	tt := s1.fsm.TimeTable()
-	tt.Witness(2000, time.Now().UTC().Add(-1*s1.config.EvalGCThreshold))
-
-	// Create a core scheduler
-	snap, err := state.Snapshot()
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	core := NewCoreScheduler(s1, snap)
-
-	// Attempt the GC
-	gc := s1.coreJobEval(structs.CoreJobEvalGC)
-	gc.ModifyIndex = 2000
-	err = core.Process(gc)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Should be gone because there is no alloc associated
-	out, err := state.EvalByID(eval.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if out != nil {
-		t.Fatalf("bad: %v", out)
-	}
-}
-
-func TestCoreScheduler_EvalGC_Batch_Allocs_WithJob(t *testing.T) {
-	s1 := testServer(t, nil)
-	defer s1.Shutdown()
-	testutil.WaitForLeader(t, s1.RPC)
-
-	// Insert job.
-	state := s1.fsm.State()
-	job := mock.Job()
-	job.Type = structs.JobTypeBatch
-	err := state.UpsertJob(1000, job)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Insert "dead" eval
-	eval := mock.Eval()
-	eval.Type = structs.JobTypeBatch
-	eval.Status = structs.EvalStatusFailed
-	eval.JobID = job.ID
-	if err := state.UpsertEvals(1001, []*structs.Evaluation{eval}); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Insert "dead" alloc
-	alloc := mock.Alloc()
-	alloc.EvalID = eval.ID
-	alloc.JobID = job.ID
-	alloc.DesiredStatus = structs.AllocDesiredStatusFailed
-	err = state.UpsertAllocs(1002, []*structs.Allocation{alloc})
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Update the time tables to make this work
-	tt := s1.fsm.TimeTable()
-	tt.Witness(2000, time.Now().UTC().Add(-1*s1.config.EvalGCThreshold))
-
-	// Create a core scheduler
-	snap, err := state.Snapshot()
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	core := NewCoreScheduler(s1, snap)
-
-	// Attempt the GC
-	gc := s1.coreJobEval(structs.CoreJobEvalGC)
-	gc.ModifyIndex = 2000
-	err = core.Process(gc)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Shouldn't be gone because there are associated allocs.
-	out, err := state.EvalByID(eval.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if out == nil {
-		t.Fatalf("bad: %v", out)
-	}
-
-	outA, err := state.AllocByID(alloc.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if outA == nil {
-		t.Fatalf("bad: %v", outA)
-	}
-}
-
-func TestCoreScheduler_EvalGC_Batch_Allocs_NoJob(t *testing.T) {
-	s1 := testServer(t, nil)
-	defer s1.Shutdown()
-	testutil.WaitForLeader(t, s1.RPC)
-
-	// Insert "dead" eval
-	state := s1.fsm.State()
-	eval := mock.Eval()
-	eval.Type = structs.JobTypeBatch
-	eval.Status = structs.EvalStatusFailed
-	err := state.UpsertEvals(1000, []*structs.Evaluation{eval})
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Insert "dead" alloc
-	alloc := mock.Alloc()
-	alloc.EvalID = eval.ID
-	alloc.DesiredStatus = structs.AllocDesiredStatusFailed
-	err = state.UpsertAllocs(1001, []*structs.Allocation{alloc})
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Update the time tables to make this work
-	tt := s1.fsm.TimeTable()
-	tt.Witness(2000, time.Now().UTC().Add(-1*s1.config.EvalGCThreshold))
-
-	// Create a core scheduler
-	snap, err := state.Snapshot()
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	core := NewCoreScheduler(s1, snap)
-
-	// Attempt the GC
-	gc := s1.coreJobEval(structs.CoreJobEvalGC)
-	gc.ModifyIndex = 2000
-	err = core.Process(gc)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Should be gone because the job is deregistered.
-	out, err := state.EvalByID(eval.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if out != nil {
-		t.Fatalf("bad: %v", out)
-	}
-}
-
 func TestCoreScheduler_EvalGC_Force(t *testing.T) {
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
@@ -330,7 +241,7 @@ func TestCoreScheduler_EvalGC_Force(t *testing.T) {
 	// Insert "dead" alloc
 	alloc := mock.Alloc()
 	alloc.EvalID = eval.ID
-	alloc.DesiredStatus = structs.AllocDesiredStatusFailed
+	alloc.DesiredStatus = structs.AllocDesiredStatusStop
 	err = state.UpsertAllocs(1001, []*structs.Allocation{alloc})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -344,7 +255,7 @@ func TestCoreScheduler_EvalGC_Force(t *testing.T) {
 	core := NewCoreScheduler(s1, snap)
 
 	// Attempt the GC
-	gc := s1.coreJobEval(structs.CoreJobForceGC)
+	gc := s1.coreJobEval(structs.CoreJobForceGC, 1001)
 	err = core.Process(gc)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -394,8 +305,7 @@ func TestCoreScheduler_NodeGC(t *testing.T) {
 	core := NewCoreScheduler(s1, snap)
 
 	// Attempt the GC
-	gc := s1.coreJobEval(structs.CoreJobNodeGC)
-	gc.ModifyIndex = 2000
+	gc := s1.coreJobEval(structs.CoreJobNodeGC, 2000)
 	err = core.Process(gc)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -444,8 +354,7 @@ func TestCoreScheduler_NodeGC_TerminalAllocs(t *testing.T) {
 	core := NewCoreScheduler(s1, snap)
 
 	// Attempt the GC
-	gc := s1.coreJobEval(structs.CoreJobNodeGC)
-	gc.ModifyIndex = 2000
+	gc := s1.coreJobEval(structs.CoreJobNodeGC, 2000)
 	err = core.Process(gc)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -496,8 +405,7 @@ func TestCoreScheduler_NodeGC_RunningAllocs(t *testing.T) {
 	core := NewCoreScheduler(s1, snap)
 
 	// Attempt the GC
-	gc := s1.coreJobEval(structs.CoreJobNodeGC)
-	gc.ModifyIndex = 2000
+	gc := s1.coreJobEval(structs.CoreJobNodeGC, 2000)
 	err = core.Process(gc)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -535,7 +443,7 @@ func TestCoreScheduler_NodeGC_Force(t *testing.T) {
 	core := NewCoreScheduler(s1, snap)
 
 	// Attempt the GC
-	gc := s1.coreJobEval(structs.CoreJobForceGC)
+	gc := s1.coreJobEval(structs.CoreJobForceGC, 1000)
 	err = core.Process(gc)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -559,19 +467,19 @@ func TestCoreScheduler_JobGC(t *testing.T) {
 		{
 			test:        "Terminal",
 			evalStatus:  structs.EvalStatusFailed,
-			allocStatus: structs.AllocDesiredStatusFailed,
+			allocStatus: structs.AllocDesiredStatusStop,
 			shouldExist: false,
 		},
 		{
 			test:        "Has Alloc",
 			evalStatus:  structs.EvalStatusFailed,
-			allocStatus: structs.AllocDesiredStatusRun,
+			allocStatus: structs.AllocDesiredStatusStop,
 			shouldExist: true,
 		},
 		{
 			test:        "Has Eval",
 			evalStatus:  structs.EvalStatusPending,
-			allocStatus: structs.AllocDesiredStatusFailed,
+			allocStatus: structs.AllocDesiredStatusStop,
 			shouldExist: true,
 		},
 	}
@@ -621,8 +529,7 @@ func TestCoreScheduler_JobGC(t *testing.T) {
 		core := NewCoreScheduler(s1, snap)
 
 		// Attempt the GC
-		gc := s1.coreJobEval(structs.CoreJobJobGC)
-		gc.ModifyIndex = 2000
+		gc := s1.coreJobEval(structs.CoreJobJobGC, 2000)
 		err = core.Process(gc)
 		if err != nil {
 			t.Fatalf("test(%s) err: %v", test.test, err)
@@ -655,6 +562,114 @@ func TestCoreScheduler_JobGC(t *testing.T) {
 	}
 }
 
+// This test ensures that batch jobs are GC'd in one shot, meaning it all
+// allocs/evals and job or nothing
+func TestCoreScheduler_JobGC_OneShot(t *testing.T) {
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Insert job.
+	state := s1.fsm.State()
+	job := mock.Job()
+	job.Type = structs.JobTypeBatch
+	err := state.UpsertJob(1000, job)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Insert two complete evals
+	eval := mock.Eval()
+	eval.JobID = job.ID
+	eval.Status = structs.EvalStatusComplete
+
+	eval2 := mock.Eval()
+	eval2.JobID = job.ID
+	eval2.Status = structs.EvalStatusComplete
+
+	err = state.UpsertEvals(1001, []*structs.Evaluation{eval, eval2})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Insert one complete alloc and one running on distinct evals
+	alloc := mock.Alloc()
+	alloc.JobID = job.ID
+	alloc.EvalID = eval.ID
+	alloc.DesiredStatus = structs.AllocDesiredStatusStop
+
+	alloc2 := mock.Alloc()
+	alloc2.JobID = job.ID
+	alloc2.EvalID = eval2.ID
+	alloc2.DesiredStatus = structs.AllocDesiredStatusRun
+
+	err = state.UpsertAllocs(1002, []*structs.Allocation{alloc, alloc2})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Force the jobs state to dead
+	job.Status = structs.JobStatusDead
+
+	// Update the time tables to make this work
+	tt := s1.fsm.TimeTable()
+	tt.Witness(2000, time.Now().UTC().Add(-1*s1.config.JobGCThreshold))
+
+	// Create a core scheduler
+	snap, err := state.Snapshot()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	core := NewCoreScheduler(s1, snap)
+
+	// Attempt the GC
+	gc := s1.coreJobEval(structs.CoreJobJobGC, 2000)
+	err = core.Process(gc)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Should still exist
+	out, err := state.JobByID(job.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out == nil {
+		t.Fatalf("bad: %v", out)
+	}
+
+	outE, err := state.EvalByID(eval.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if outE == nil {
+		t.Fatalf("bad: %v", outE)
+	}
+
+	outE2, err := state.EvalByID(eval2.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if outE2 == nil {
+		t.Fatalf("bad: %v", outE2)
+	}
+
+	outA, err := state.AllocByID(alloc.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if outA == nil {
+		t.Fatalf("bad: %v", outA)
+	}
+	outA2, err := state.AllocByID(alloc2.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if outA2 == nil {
+		t.Fatalf("bad: %v", outA2)
+	}
+}
+
 func TestCoreScheduler_JobGC_Force(t *testing.T) {
 	tests := []struct {
 		test, evalStatus, allocStatus string
@@ -663,7 +678,7 @@ func TestCoreScheduler_JobGC_Force(t *testing.T) {
 		{
 			test:        "Terminal",
 			evalStatus:  structs.EvalStatusFailed,
-			allocStatus: structs.AllocDesiredStatusFailed,
+			allocStatus: structs.AllocDesiredStatusStop,
 			shouldExist: false,
 		},
 		{
@@ -675,7 +690,7 @@ func TestCoreScheduler_JobGC_Force(t *testing.T) {
 		{
 			test:        "Has Eval",
 			evalStatus:  structs.EvalStatusPending,
-			allocStatus: structs.AllocDesiredStatusFailed,
+			allocStatus: structs.AllocDesiredStatusStop,
 			shouldExist: true,
 		},
 	}
@@ -721,7 +736,7 @@ func TestCoreScheduler_JobGC_Force(t *testing.T) {
 		core := NewCoreScheduler(s1, snap)
 
 		// Attempt the GC
-		gc := s1.coreJobEval(structs.CoreJobForceGC)
+		gc := s1.coreJobEval(structs.CoreJobForceGC, 1002)
 		err = core.Process(gc)
 		if err != nil {
 			t.Fatalf("test(%s) err: %v", test.test, err)

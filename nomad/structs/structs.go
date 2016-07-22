@@ -634,6 +634,10 @@ type Node struct {
 	// StatusDescription is meant to provide more human useful information
 	StatusDescription string
 
+	// StatusUpdatedAt is the time stamp at which the state of the node was
+	// updated
+	StatusUpdatedAt int64
+
 	// Raft Indexes
 	CreateIndex uint64
 	ModifyIndex uint64
@@ -703,7 +707,7 @@ type Resources struct {
 	Networks []*NetworkResource
 }
 
-// DefaultResources returns the minimum resources a task can use and be valid.
+// DefaultResources returns the default resources for a task.
 func DefaultResources() *Resources {
 	return &Resources{
 		CPU:      100,
@@ -729,6 +733,18 @@ func (r *Resources) Merge(other *Resources) {
 	}
 	if len(other.Networks) != 0 {
 		r.Networks = other.Networks
+	}
+}
+
+func (r *Resources) Canonicalize() {
+	// Ensure that an empty and nil slices are treated the same to avoid scheduling
+	// problems since we use reflect DeepEquals.
+	if len(r.Networks) == 0 {
+		r.Networks = nil
+	}
+
+	for _, n := range r.Networks {
+		n.Canonicalize()
 	}
 }
 
@@ -846,6 +862,17 @@ type NetworkResource struct {
 	DynamicPorts  []Port // Dynamically assigned ports
 }
 
+func (n *NetworkResource) Canonicalize() {
+	// Ensure that an empty and nil slices are treated the same to avoid scheduling
+	// problems since we use reflect DeepEquals.
+	if len(n.ReservedPorts) == 0 {
+		n.ReservedPorts = nil
+	}
+	if len(n.DynamicPorts) == 0 {
+		n.DynamicPorts = nil
+	}
+}
+
 // MeetsMinResources returns an error if the resources specified are less than
 // the minimum allowed.
 func (n *NetworkResource) MeetsMinResources() error {
@@ -933,6 +960,22 @@ const (
 	CoreJobPriority = JobMaxPriority * 2
 )
 
+// JobSummary summarizes the state of the allocations of a job
+type JobSummary struct {
+	JobID   string
+	Summary map[string]TaskGroupSummary
+}
+
+// TaskGroup summarizes the state of all the allocations of a particular
+// TaskGroup
+type TaskGroupSummary struct {
+	Complete int
+	Failed   int
+	Running  int
+	Starting int
+	Lost     int
+}
+
 // Job is the scope of a scheduling request to Nomad. It is the largest
 // scoped object, and is a named collection of task groups. Each task group
 // is further composed of tasks. A task group (TG) is the unit of scheduling
@@ -1000,11 +1043,17 @@ type Job struct {
 	JobModifyIndex uint64
 }
 
-// InitFields is used to initialize fields in the Job. This should be called
+// Canonicalize is used to canonicalize fields in the Job. This should be called
 // when registering a Job.
-func (j *Job) InitFields() {
+func (j *Job) Canonicalize() {
+	// Ensure that an empty and nil map are treated the same to avoid scheduling
+	// problems since we use reflect DeepEquals.
+	if len(j.Meta) == 0 {
+		j.Meta = nil
+	}
+
 	for _, tg := range j.TaskGroups {
-		tg.InitFields(j)
+		tg.Canonicalize(j)
 	}
 }
 
@@ -1076,23 +1125,23 @@ func (j *Job) Validate() error {
 			taskGroups[tg.Name] = idx
 		}
 
-		if j.Type == "system" && tg.Count != 1 {
+		if j.Type == "system" && tg.Count > 1 {
 			mErr.Errors = append(mErr.Errors,
-				fmt.Errorf("Job task group %d has count %d. Only count of 1 is supported with system scheduler",
-					idx+1, tg.Count))
+				fmt.Errorf("Job task group %s has count %d. Count cannot exceed 1 with system scheduler",
+					tg.Name, tg.Count))
 		}
 	}
 
 	// Validate the task group
-	for idx, tg := range j.TaskGroups {
+	for _, tg := range j.TaskGroups {
 		if err := tg.Validate(); err != nil {
-			outer := fmt.Errorf("Task group %d validation failed: %s", idx+1, err)
+			outer := fmt.Errorf("Task group %s validation failed: %s", tg.Name, err)
 			mErr.Errors = append(mErr.Errors, outer)
 		}
 	}
 
 	// Validate periodic is only used with batch jobs.
-	if j.IsPeriodic() {
+	if j.IsPeriodic() && j.Periodic.Enabled {
 		if j.Type != JobTypeBatch {
 			mErr.Errors = append(mErr.Errors,
 				fmt.Errorf("Periodic can only be used with %q scheduler", JobTypeBatch))
@@ -1410,15 +1459,21 @@ func (tg *TaskGroup) Copy() *TaskGroup {
 	return ntg
 }
 
-// InitFields is used to initialize fields in the TaskGroup.
-func (tg *TaskGroup) InitFields(job *Job) {
+// Canonicalize is used to canonicalize fields in the TaskGroup.
+func (tg *TaskGroup) Canonicalize(job *Job) {
+	// Ensure that an empty and nil map are treated the same to avoid scheduling
+	// problems since we use reflect DeepEquals.
+	if len(tg.Meta) == 0 {
+		tg.Meta = nil
+	}
+
 	// Set the default restart policy.
 	if tg.RestartPolicy == nil {
 		tg.RestartPolicy = NewRestartPolicy(job.Type)
 	}
 
 	for _, task := range tg.Tasks {
-		task.InitFields(job, tg)
+		task.Canonicalize(job, tg)
 	}
 }
 
@@ -1462,9 +1517,9 @@ func (tg *TaskGroup) Validate() error {
 	}
 
 	// Validate the tasks
-	for idx, task := range tg.Tasks {
+	for _, task := range tg.Tasks {
 		if err := task.Validate(); err != nil {
-			outer := fmt.Errorf("Task %d validation failed: %s", idx+1, err)
+			outer := fmt.Errorf("Task %s validation failed: %s", task.Name, err)
 			mErr.Errors = append(mErr.Errors, outer)
 		}
 	}
@@ -1504,14 +1559,15 @@ const (
 // The ServiceCheck data model represents the consul health check that
 // Nomad registers for a Task
 type ServiceCheck struct {
-	Name     string        // Name of the check, defaults to id
-	Type     string        // Type of the check - tcp, http, docker and script
-	Command  string        // Command is the command to run for script checks
-	Args     []string      // Args is a list of argumes for script checks
-	Path     string        // path of the health check url for http type check
-	Protocol string        // Protocol to use if check is http, defaults to http
-	Interval time.Duration // Interval of the check
-	Timeout  time.Duration // Timeout of the response from the check before consul fails the check
+	Name      string        // Name of the check, defaults to id
+	Type      string        // Type of the check - tcp, http, docker and script
+	Command   string        // Command is the command to run for script checks
+	Args      []string      // Args is a list of argumes for script checks
+	Path      string        // path of the health check url for http type check
+	Protocol  string        // Protocol to use if check is http, defaults to http
+	PortLabel string        `mapstructure:"port"` // The port to use for tcp/http checks
+	Interval  time.Duration // Interval of the check
+	Timeout   time.Duration // Timeout of the response from the check before consul fails the check
 }
 
 func (sc *ServiceCheck) Copy() *ServiceCheck {
@@ -1523,20 +1579,32 @@ func (sc *ServiceCheck) Copy() *ServiceCheck {
 	return nsc
 }
 
+func (sc *ServiceCheck) Canonicalize(serviceName string) {
+	// Ensure empty slices are treated as null to avoid scheduling issues when
+	// using DeepEquals.
+	if len(sc.Args) == 0 {
+		sc.Args = nil
+	}
+
+	if sc.Name == "" {
+		sc.Name = fmt.Sprintf("service: %q check", serviceName)
+	}
+}
+
 // validate a Service's ServiceCheck
 func (sc *ServiceCheck) validate() error {
 	switch strings.ToLower(sc.Type) {
 	case ServiceCheckTCP:
-		if sc.Timeout > 0 && sc.Timeout <= minCheckTimeout {
-			return fmt.Errorf("timeout %v is lower than required minimum timeout %v", sc.Timeout, minCheckInterval)
+		if sc.Timeout < minCheckTimeout {
+			return fmt.Errorf("timeout (%v) is lower than required minimum timeout %v", sc.Timeout, minCheckInterval)
 		}
 	case ServiceCheckHTTP:
 		if sc.Path == "" {
 			return fmt.Errorf("http type must have a valid http path")
 		}
 
-		if sc.Timeout > 0 && sc.Timeout <= minCheckTimeout {
-			return fmt.Errorf("timeout %v is lower than required minimum timeout %v", sc.Timeout, minCheckInterval)
+		if sc.Timeout < minCheckTimeout {
+			return fmt.Errorf("timeout (%v) is lower than required minimum timeout %v", sc.Timeout, minCheckInterval)
 		}
 	case ServiceCheckScript:
 		if sc.Command == "" {
@@ -1549,7 +1617,7 @@ func (sc *ServiceCheck) validate() error {
 		return fmt.Errorf(`invalid type (%+q), must be one of "http", "tcp", or "script" type`, sc.Type)
 	}
 
-	if sc.Interval > 0 && sc.Interval <= minCheckInterval {
+	if sc.Interval < minCheckInterval {
 		return fmt.Errorf("interval (%v) can not be lower than %v", sc.Interval, minCheckInterval)
 	}
 
@@ -1575,6 +1643,7 @@ func (sc *ServiceCheck) Hash(serviceID string) string {
 	io.WriteString(h, strings.Join(sc.Args, ""))
 	io.WriteString(h, sc.Path)
 	io.WriteString(h, sc.Protocol)
+	io.WriteString(h, sc.PortLabel)
 	io.WriteString(h, sc.Interval.String())
 	io.WriteString(h, sc.Timeout.String())
 	return fmt.Sprintf("%x", h.Sum(nil))
@@ -1614,9 +1683,18 @@ func (s *Service) Copy() *Service {
 	return ns
 }
 
-// InitFields interpolates values of Job, Task Group and Task in the Service
+// Canonicalize interpolates values of Job, Task Group and Task in the Service
 // Name. This also generates check names, service id and check ids.
-func (s *Service) InitFields(job string, taskGroup string, task string) {
+func (s *Service) Canonicalize(job string, taskGroup string, task string) {
+	// Ensure empty lists are treated as null to avoid scheduler issues when
+	// using DeepEquals
+	if len(s.Tags) == 0 {
+		s.Tags = nil
+	}
+	if len(s.Checks) == 0 {
+		s.Checks = nil
+	}
+
 	s.Name = args.ReplaceEnv(s.Name, map[string]string{
 		"JOB":       job,
 		"TASKGROUP": taskGroup,
@@ -1626,9 +1704,7 @@ func (s *Service) InitFields(job string, taskGroup string, task string) {
 	)
 
 	for _, check := range s.Checks {
-		if check.Name == "" {
-			check.Name = fmt.Sprintf("service: %q check", s.Name)
-		}
+		check.Canonicalize(s.Name)
 	}
 }
 
@@ -1647,7 +1723,7 @@ func (s *Service) Validate() error {
 
 	for _, c := range s.Checks {
 		if s.PortLabel == "" && c.RequiresPort() {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("check %s invalid: check requires a port but the service %+q has no port", c.Name))
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("check %s invalid: check requires a port but the service %+q has no port", c.Name, s.Name))
 			continue
 		}
 
@@ -1705,6 +1781,7 @@ type LogShuttleConfig struct {
 	KinesisShards int
 }
 
+// DefaultLogConfig returns the default LogConfig values.
 func DefaultLogConfig() *LogConfig {
 	return &LogConfig{
 		MaxFiles:      10,
@@ -1808,22 +1885,31 @@ func (t *Task) Copy() *Task {
 	return nt
 }
 
-// InitFields initializes fields in the task.
-func (t *Task) InitFields(job *Job, tg *TaskGroup) {
-	t.InitServiceFields(job.Name, tg.Name)
+// Canonicalize canonicalizes fields in the task.
+func (t *Task) Canonicalize(job *Job, tg *TaskGroup) {
+	// Ensure that an empty and nil map are treated the same to avoid scheduling
+	// problems since we use reflect DeepEquals.
+	if len(t.Meta) == 0 {
+		t.Meta = nil
+	}
+	if len(t.Config) == 0 {
+		t.Config = nil
+	}
+	if len(t.Env) == 0 {
+		t.Env = nil
+	}
+
+	for _, service := range t.Services {
+		service.Canonicalize(job.Name, tg.Name, t.Name)
+	}
+
+	if t.Resources != nil {
+		t.Resources.Canonicalize()
+	}
 
 	// Set the default timeout if it is not specified.
 	if t.KillTimeout == 0 {
 		t.KillTimeout = DefaultKillTimeout
-	}
-}
-
-// InitServiceFields interpolates values of Job, Task Group
-// and Tasks in all the service Names of a Task. This also generates the service
-// id, check id and check names.
-func (t *Task) InitServiceFields(job string, taskGroup string) {
-	for _, service := range t.Services {
-		service.InitFields(job, taskGroup, t.Name)
 	}
 }
 
@@ -2319,10 +2405,9 @@ func (c *Constraint) Validate() error {
 }
 
 const (
-	AllocDesiredStatusRun    = "run"    // Allocation should run
-	AllocDesiredStatusStop   = "stop"   // Allocation should stop
-	AllocDesiredStatusEvict  = "evict"  // Allocation should stop, and was evicted
-	AllocDesiredStatusFailed = "failed" // Allocation failed to be done
+	AllocDesiredStatusRun   = "run"   // Allocation should run
+	AllocDesiredStatusStop  = "stop"  // Allocation should stop
+	AllocDesiredStatusEvict = "evict" // Allocation should stop, and was evicted
 )
 
 const (
@@ -2330,6 +2415,7 @@ const (
 	AllocClientStatusRunning  = "running"
 	AllocClientStatusComplete = "complete"
 	AllocClientStatusFailed   = "failed"
+	AllocClientStatusLost     = "lost"
 )
 
 // Allocation is used to allocate the placement of a task group to a node.
@@ -2430,13 +2516,13 @@ func (a *Allocation) TerminalStatus() bool {
 	// First check the desired state and if that isn't terminal, check client
 	// state.
 	switch a.DesiredStatus {
-	case AllocDesiredStatusStop, AllocDesiredStatusEvict, AllocDesiredStatusFailed:
+	case AllocDesiredStatusStop, AllocDesiredStatusEvict:
 		return true
 	default:
 	}
 
 	switch a.ClientStatus {
-	case AllocClientStatusComplete, AllocClientStatusFailed:
+	case AllocClientStatusComplete, AllocClientStatusFailed, AllocClientStatusLost:
 		return true
 	default:
 		return false

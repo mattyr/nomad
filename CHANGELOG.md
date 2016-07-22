@@ -1,4 +1,16 @@
-## 0.4.0 (UNRELEASED)
+## 0.4.1 (UNRELEASED)
+
+IMPROVEMENTS:
+  * core: Allow count 0 on system jobs [GH-1421]
+  * core: Gracefully handle short lived outages by holding RPC calls [GH-1403]
+  * api/cli: Support for tailing/streaming files [GH-1404, GH-1420]
+
+BUG FIXES:
+  * core: Sanitize empty slices/maps in jobs to avoid incorrect create/destroy
+    updates [GH-1434]
+  * client: Task start errors adhere to restart policy mode [GH-1405]
+
+## 0.4.0
 
 __BACKWARDS INCOMPATIBILITIES:__
   * api: Tasks are no longer allowed to have slashes in their name [GH-1210]
@@ -6,6 +18,8 @@ __BACKWARDS INCOMPATIBILITIES:__
     eval-status -monitor`.
   * config: Consul configuration has been moved from client options map to
     consul block under client configuration
+  * driver/docker: Enabled SSL by default for pulling images from docker
+    registries. [GH-1336]
 
 IMPROVEMENTS:
   * core: Scheduler reuses blocked evaluations to avoid unbounded creation of
@@ -19,12 +33,15 @@ IMPROVEMENTS:
     modified from a known state [GH-1243]
   * api/client: Add resource usage APIs for retrieving tasks/allocations/host
     resource usage [GH-1189]
+  * cli: Faster when displaying large amounts ouptuts [GH-1362]
   * cli: Deprecate `eval-monitor` and introduce `eval-status` [GH-1206]
   * cli: Unify the `fs` family of commands to be a single command [GH-1150]
   * cli: Introduce `nomad plan` to dry-run a job through the scheduler and
     determine its effects [GH-1181]
   * cli: node-status command displays host resource usage and allocation
     resources [GH-1261]
+  * cli: Region flag and environment variable introduced to set region
+    forwarding. Automatic region forwarding for run and plan [GH-1237]
   * client: If Consul is available, automatically bootstrap Nomad Client
     using the `_nomad` service in Consul. Nomad Servers now register
     themselves with Consul to make this possible. [GH-1201]
@@ -32,6 +49,8 @@ IMPROVEMENTS:
     if the artifact exists inside a chrooted directory [GH-1262]
   * driver/docker: Added a client options to set SELinux labels for container
     bind mounts. [GH-788]
+  * driver/docker: Enabled SSL by default for pulling images from docker
+    registries. [GH-1336]
   * server: If Consul is available, automatically bootstrap Nomad Servers
     using the `_nomad` service in Consul.  [GH-1276]
 
@@ -41,17 +60,20 @@ BUG FIXES:
     retried [GH-1231]
   * core: Do not restart successful batch jobs when the node is removed/drained
     [GH-1205]
+  * core: Fix an issue in which the scheduler could be invoked with insufficient
+    state [GH-1339]
   * core: Updated User, Meta or Resources in a task cause create/destroy updates
     [GH-1128, GH-1153]
   * core: Fix blocked evaluations being run without properly accounting for
     priority [GH-1183]
   * api: Tasks are no longer allowed to have slashes in their name [GH-1210]
   * client: Delete tmp files used to communicate with execcutor [GH-1241]
-  * client: Prvent the client from restoring with incorrect task state [GH-1294]
+  * client: Prevent the client from restoring with incorrect task state [GH-1294]
   * discovery: Ensure service and check names are unique [GH-1143, GH-1144]
   * driver/docker: Ensure docker client doesn't time out after a minute.
     [GH-1184]
   * driver/java: Fix issue in which Java on darwin attempted to chroot [GH-1262]
+  * driver/docker: Fix issue in which logs could be spliced [GH-1322]
 
 ## 0.3.2 (April 22, 2016)
 

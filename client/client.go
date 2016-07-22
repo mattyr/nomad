@@ -144,10 +144,7 @@ type Client struct {
 }
 
 // NewClient is used to create a new client from the given configuration
-func NewClient(cfg *config.Config, consulSyncer *consul.Syncer) (*Client, error) {
-	// Create a logger
-	logger := log.New(cfg.LogOutput, "", log.LstdFlags)
-
+func NewClient(cfg *config.Config, consulSyncer *consul.Syncer, logger *log.Logger) (*Client, error) {
 	// Create the client
 	c := &Client{
 		config:             cfg,
@@ -607,11 +604,11 @@ func (c *Client) reservePorts() {
 func (c *Client) fingerprint() error {
 	whitelist := c.config.ReadStringListToMap("fingerprint.whitelist")
 	whitelistEnabled := len(whitelist) > 0
-	c.logger.Printf("[DEBUG] client: built-in fingerprints: %v", fingerprint.BuiltinFingerprints)
+	c.logger.Printf("[DEBUG] client: built-in fingerprints: %v", fingerprint.BuiltinFingerprints())
 
 	var applied []string
 	var skipped []string
-	for _, name := range fingerprint.BuiltinFingerprints {
+	for _, name := range fingerprint.BuiltinFingerprints() {
 		// Skip modules that are not in the whitelist if it is enabled.
 		if _, ok := whitelist[name]; whitelistEnabled && !ok {
 			skipped = append(skipped, name)
@@ -1251,12 +1248,8 @@ func (c *Client) setupConsulSyncer() error {
 			// Nomad servers are available within
 			// datacenterQueryLimit, the next heartbeat will pick
 			// a new set of servers so it's okay.
-			nearestDC := dcs[0]
-			otherDCs := make([]string, 0, len(dcs))
-			shuffleStrings(otherDCs)
-			otherDCs = dcs[1:lib.MinInt(len(dcs), datacenterQueryLimit)]
-
-			dcs = append([]string{nearestDC}, otherDCs...)
+			shuffleStrings(dcs[1:])
+			dcs = dcs[0:lib.MinInt(len(dcs), datacenterQueryLimit)]
 		}
 
 		// Forward RPCs to our region

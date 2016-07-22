@@ -101,15 +101,7 @@ type DockerDriverConfig struct {
 	ShmSize          int64               `mapstructure:"shm_size"`           // Size of /dev/shm of the container in bytes
 }
 
-func (c *DockerDriverConfig) Init() error {
-	if strings.Contains(c.ImageName, "https://") {
-		c.SSL = true
-		c.ImageName = strings.Replace(c.ImageName, "https://", "", 1)
-	}
-
-	return nil
-}
-
+// Validate validates a docker driver config
 func (c *DockerDriverConfig) Validate() error {
 	if c.ImageName == "" {
 		return fmt.Errorf("Docker Driver needs an image name")
@@ -119,6 +111,24 @@ func (c *DockerDriverConfig) Validate() error {
 	c.Labels = mapMergeStrStr(c.LabelsRaw...)
 
 	return nil
+}
+
+// NewDockerDriverConfig returns a docker driver config by parsing the HCL
+// config
+func NewDockerDriverConfig(task *structs.Task) (*DockerDriverConfig, error) {
+	var driverConfig DockerDriverConfig
+	driverConfig.SSL = true
+	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+		return nil, err
+	}
+	if strings.Contains(driverConfig.ImageName, "https://") {
+		driverConfig.ImageName = strings.Replace(driverConfig.ImageName, "https://", "", 1)
+	}
+
+	if err := driverConfig.Validate(); err != nil {
+		return nil, err
+	}
+	return &driverConfig, nil
 }
 
 type dockerPID struct {
@@ -247,6 +257,11 @@ func (d *DockerDriver) dockerClients() (*docker.Client, *docker.Client, error) {
 	var err error
 	var merr multierror.Error
 	createClients.Do(func() {
+		if err = shelpers.Init(); err != nil {
+			d.logger.Printf("[FATAL] driver.docker: unable to initialize stats: %v", err)
+			return
+		}
+
 		// Default to using whatever is configured in docker.endpoint. If this is
 		// not specified we'll fall back on NewClientFromEnv which reads config from
 		// the DOCKER_* environment variables DOCKER_HOST, DOCKER_TLS_VERIFY, and
@@ -261,11 +276,25 @@ func (d *DockerDriver) dockerClients() (*docker.Client, *docker.Client, error) {
 			if cert+key+ca != "" {
 				d.logger.Printf("[DEBUG] driver.docker: using TLS client connection to %s", dockerEndpoint)
 				client, err = docker.NewTLSClient(dockerEndpoint, cert, key, ca)
+				if err != nil {
+					merr.Errors = append(merr.Errors, err)
+				}
+				waitClient, err = docker.NewTLSClient(dockerEndpoint, cert, key, ca)
+				if err != nil {
+					merr.Errors = append(merr.Errors, err)
+				}
 			} else {
 				d.logger.Printf("[DEBUG] driver.docker: using standard client connection to %s", dockerEndpoint)
 				client, err = docker.NewClient(dockerEndpoint)
+				if err != nil {
+					merr.Errors = append(merr.Errors, err)
+				}
+				waitClient, err = docker.NewClient(dockerEndpoint)
+				if err != nil {
+					merr.Errors = append(merr.Errors, err)
+				}
 			}
-			client.HTTPClient.Timeout = dockerTimeout
+			client.SetTimeout(dockerTimeout)
 			return
 		}
 
@@ -274,7 +303,7 @@ func (d *DockerDriver) dockerClients() (*docker.Client, *docker.Client, error) {
 		if err != nil {
 			merr.Errors = append(merr.Errors, err)
 		}
-		client.HTTPClient.Timeout = dockerTimeout
+		client.SetTimeout(dockerTimeout)
 
 		waitClient, err = docker.NewClientFromEnv()
 		if err != nil {
@@ -328,8 +357,8 @@ func (d *DockerDriver) containerBinds(alloc *allocdir.AllocDir, task *structs.Ta
 		return nil, fmt.Errorf("Failed to find task local directory: %v", task.Name)
 	}
 
-	allocDirBind := fmt.Sprintf("%s:/%s", shared, allocdir.SharedAllocName)
-	taskLocalBind := fmt.Sprintf("%s:/%s", local, allocdir.TaskLocal)
+	allocDirBind := fmt.Sprintf("%s:%s", shared, allocdir.SharedAllocContainerPath)
+	taskLocalBind := fmt.Sprintf("%s:%s", local, allocdir.TaskLocalContainerPath)
 
 	if selinuxLabel := d.config.Read("docker.volumes.selinuxlabel"); selinuxLabel != "" {
 		allocDirBind = fmt.Sprintf("%s:%s", allocDirBind, selinuxLabel)
@@ -358,8 +387,8 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 	}
 
 	// Set environment variables.
-	d.taskEnv.SetAllocDir(filepath.Join("/", allocdir.SharedAllocName))
-	d.taskEnv.SetTaskLocalDir(filepath.Join("/", allocdir.TaskLocal))
+	d.taskEnv.SetAllocDir(allocdir.SharedAllocContainerPath)
+	d.taskEnv.SetTaskLocalDir(allocdir.TaskLocalContainerPath)
 
 	config := &docker.Config{
 		Image:        driverConfig.ImageName,
@@ -672,16 +701,8 @@ func (d *DockerDriver) loadImage(driverConfig *DockerDriverConfig, client *docke
 }
 
 func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
-	var driverConfig DockerDriverConfig
-	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
-		return nil, err
-	}
-
-	if err := driverConfig.Init(); err != nil {
-		return nil, err
-	}
-
-	if err := driverConfig.Validate(); err != nil {
+	driverConfig, err := NewDockerDriverConfig(task)
+	if err != nil {
 		return nil, err
 	}
 
@@ -698,7 +719,7 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		return nil, fmt.Errorf("Failed to connect to docker daemon: %s", err)
 	}
 
-	if err := d.createImage(&driverConfig, client, taskDir); err != nil {
+	if err := d.createImage(driverConfig, client, taskDir); err != nil {
 		return nil, fmt.Errorf("failed to create image: %v", err)
 	}
 
@@ -738,7 +759,7 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		return nil, fmt.Errorf("failed to start syslog collector: %v", err)
 	}
 
-	config, err := d.createContainer(ctx, task, &driverConfig, ss.Addr)
+	config, err := d.createContainer(ctx, task, driverConfig, ss.Addr)
 	if err != nil {
 		d.logger.Printf("[ERR] driver.docker: failed to create container configuration for image %s: %s", image, err)
 		pluginClient.Kill()
@@ -876,7 +897,8 @@ func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, er
 	exec, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
 	if err != nil {
 		d.logger.Printf("[INFO] driver.docker: couldn't re-attach to the plugin process: %v", err)
-		if e := client.StopContainer(pid.ContainerID, uint(pid.KillTimeout*time.Second)); e != nil {
+		d.logger.Printf("[DEBUG] driver.docker: stopping container %q", pid.ContainerID)
+		if e := client.StopContainer(pid.ContainerID, uint(pid.KillTimeout.Seconds())); e != nil {
 			d.logger.Printf("[DEBUG] driver.docker: couldn't stop container: %v", e)
 		}
 		return nil, err

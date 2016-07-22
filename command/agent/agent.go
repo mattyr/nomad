@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -47,7 +46,6 @@ type Agent struct {
 
 	client         *client.Client
 	clientHTTPAddr string
-	clientRPCAddr  string
 
 	server         *nomad.Server
 	serverHTTPAddr string
@@ -61,20 +59,14 @@ type Agent struct {
 
 // NewAgent is used to create a new agent with the given configuration
 func NewAgent(config *Config, logOutput io.Writer) (*Agent, error) {
-	// Ensure we have a log sink
-	if logOutput == nil {
-		logOutput = os.Stderr
-	}
-
-	shutdownCh := make(chan struct{})
 	a := &Agent{
 		config:     config,
-		logger:     log.New(logOutput, "", log.LstdFlags),
+		logger:     log.New(logOutput, "", log.LstdFlags|log.Lmicroseconds),
 		logOutput:  logOutput,
-		shutdownCh: shutdownCh,
+		shutdownCh: make(chan struct{}),
 	}
 
-	if err := a.setupConsulSyncer(shutdownCh); err != nil {
+	if err := a.setupConsulSyncer(); err != nil {
 		return nil, fmt.Errorf("Failed to initialize Consul syncer task: %v", err)
 	}
 	if err := a.setupServer(); err != nil {
@@ -336,22 +328,6 @@ func (a *Agent) clientConfig() (*clientconfig.Config, error) {
 	conf.Node.HTTPAddr = httpAddr
 	a.clientHTTPAddr = httpAddr
 
-	// Resolve the Client's RPC address
-	if a.config.AdvertiseAddrs.RPC != "" {
-		a.clientRPCAddr = a.config.AdvertiseAddrs.RPC
-	} else if a.config.Addresses.RPC != "" {
-		a.clientRPCAddr = fmt.Sprintf("%v:%v", a.config.Addresses.RPC, a.config.Ports.RPC)
-	} else if a.config.BindAddr != "" {
-		a.clientRPCAddr = fmt.Sprintf("%v:%v", a.config.BindAddr, a.config.Ports.RPC)
-	} else {
-		a.clientRPCAddr = fmt.Sprintf("%v:%v", "127.0.0.1", a.config.Ports.RPC)
-	}
-	addr, err = net.ResolveTCPAddr("tcp", a.clientRPCAddr)
-	if err != nil {
-		return nil, fmt.Errorf("error resolving RPC addr %+q: %v", a.clientRPCAddr, err)
-	}
-	a.clientRPCAddr = fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
-
 	// Reserve resources on the node.
 	r := conf.Node.Reserved
 	if r == nil {
@@ -389,7 +365,7 @@ func (a *Agent) setupServer() error {
 	}
 
 	// Create the server
-	server, err := nomad.NewServer(conf, a.consulSyncer)
+	server, err := nomad.NewServer(conf, a.consulSyncer, a.logger)
 	if err != nil {
 		return fmt.Errorf("server setup failed: %v", err)
 	}
@@ -468,7 +444,7 @@ func (a *Agent) setupClient() error {
 	}
 
 	// Create the client
-	client, err := client.NewClient(conf, a.consulSyncer)
+	client, err := client.NewClient(conf, a.consulSyncer, a.logger)
 	if err != nil {
 		return fmt.Errorf("client setup failed: %v", err)
 	}
@@ -656,9 +632,9 @@ func (a *Agent) Stats() map[string]map[string]string {
 
 // setupConsulSyncer creates the Consul tasks used by this Nomad Agent
 // (either Client or Server mode).
-func (a *Agent) setupConsulSyncer(shutdownCh chan struct{}) error {
+func (a *Agent) setupConsulSyncer() error {
 	var err error
-	a.consulSyncer, err = consul.NewSyncer(a.config.Consul, shutdownCh, a.logger)
+	a.consulSyncer, err = consul.NewSyncer(a.config.Consul, a.shutdownCh, a.logger)
 	if err != nil {
 		return err
 	}
