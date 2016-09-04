@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
-
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver"
@@ -65,10 +64,11 @@ type TaskRunner struct {
 	// downloaded
 	artifactsDownloaded bool
 
-	destroy     bool
-	destroyCh   chan struct{}
-	destroyLock sync.Mutex
-	waitCh      chan struct{}
+	destroy      bool
+	destroyCh    chan struct{}
+	destroyLock  sync.Mutex
+	destroyEvent *structs.TaskEvent
+	waitCh       chan struct{}
 }
 
 // taskRunnerState is used to snapshot the state of the task runner
@@ -147,19 +147,15 @@ func (r *TaskRunner) RestoreState() error {
 
 	// Restore fields
 	if snap.Task == nil {
-		err := fmt.Errorf("task runner snapshot include nil Task")
-		r.logger.Printf("[ERR] client: %v", err)
-		return err
+		return fmt.Errorf("task runner snapshot include nil Task")
 	} else {
 		r.task = snap.Task
 	}
 	r.artifactsDownloaded = snap.ArtifactDownloaded
 
 	if err := r.setTaskEnv(); err != nil {
-		err := fmt.Errorf("failed to create task environment for task %q in allocation %q: %v",
+		return fmt.Errorf("client: failed to create task environment for task %q in allocation %q: %v",
 			r.task.Name, r.alloc.ID, err)
-		r.logger.Printf("[ERR] client: %s", err)
-		return err
 	}
 
 	// Restore the driver
@@ -212,7 +208,7 @@ func (r *TaskRunner) DestroyState() error {
 func (r *TaskRunner) setState(state string, event *structs.TaskEvent) {
 	// Persist our state to disk.
 	if err := r.SaveState(); err != nil {
-		r.logger.Printf("[ERR] client: failed to save state of Task Runner: %v", r.task.Name)
+		r.logger.Printf("[ERR] client: failed to save state of Task Runner for task %q: %v", r.task.Name, err)
 	}
 
 	// Indicate the task has been updated.
@@ -233,17 +229,14 @@ func (r *TaskRunner) setTaskEnv() error {
 // createDriver makes a driver for the task
 func (r *TaskRunner) createDriver() (driver.Driver, error) {
 	if r.taskEnv == nil {
-		err := fmt.Errorf("task environment not made for task %q in allocation %q", r.task.Name, r.alloc.ID)
-		return nil, err
+		return nil, fmt.Errorf("task environment not made for task %q in allocation %q", r.task.Name, r.alloc.ID)
 	}
 
 	driverCtx := driver.NewDriverContext(r.task.Name, r.config, r.config.Node, r.logger, r.taskEnv)
 	driver, err := driver.NewDriver(r.task.Driver, driverCtx)
 	if err != nil {
-		err = fmt.Errorf("failed to create driver '%s' for alloc %s: %v",
+		return nil, fmt.Errorf("failed to create driver '%s' for alloc %s: %v",
 			r.task.Driver, r.alloc.ID, err)
-		r.logger.Printf("[ERR] client: %s", err)
-		return nil, err
 	}
 	return driver, err
 }
@@ -305,7 +298,7 @@ func (r *TaskRunner) validateTask() error {
 }
 
 func (r *TaskRunner) run() {
-	// Predeclare things so we an jump to the RESTART
+	// Predeclare things so we can jump to the RESTART
 	var handleEmpty bool
 	var stopCollection chan struct{}
 
@@ -323,8 +316,8 @@ func (r *TaskRunner) run() {
 			}
 
 			for _, artifact := range r.task.Artifacts {
-				if err := getter.GetArtifact(r.taskEnv, artifact, taskDir, r.logger); err != nil {
-					r.setState(structs.TaskStateDead,
+				if err := getter.GetArtifact(r.taskEnv, artifact, taskDir); err != nil {
+					r.setState(structs.TaskStatePending,
 						structs.NewTaskEvent(structs.TaskArtifactDownloadFailed).SetDownloadError(err))
 					r.restartTracker.SetStartError(dstructs.NewRecoverableError(err, true))
 					goto RESTART
@@ -392,6 +385,11 @@ func (r *TaskRunner) run() {
 					r.logger.Printf("[ERR] client: update to task %q failed: %v", r.task.Name, err)
 				}
 			case <-r.destroyCh:
+				// Mark that we received the kill event
+				timeout := driver.GetKillTimeout(r.task.KillTimeout, r.config.MaxKillTimeout)
+				r.setState(structs.TaskStateRunning,
+					structs.NewTaskEvent(structs.TaskKilling).SetKillTimeout(timeout))
+
 				// Kill the task using an exponential backoff in-case of failures.
 				destroySuccess, err := r.handleDestroy()
 				if !destroySuccess {
@@ -404,6 +402,16 @@ func (r *TaskRunner) run() {
 
 				// Store that the task has been destroyed and any associated error.
 				r.setState(structs.TaskStateDead, structs.NewTaskEvent(structs.TaskKilled).SetKillError(err))
+
+				// Store the task event that provides context on the task destroy.
+				if r.destroyEvent.Type != structs.TaskKilled {
+					r.setState(structs.TaskStateDead, r.destroyEvent)
+				}
+
+				r.runningLock.Lock()
+				r.running = false
+				r.runningLock.Unlock()
+
 				return
 			}
 		}
@@ -443,8 +451,8 @@ func (r *TaskRunner) run() {
 		destroyed := r.destroy
 		r.destroyLock.Unlock()
 		if destroyed {
-			r.logger.Printf("[DEBUG] client: Not restarting task: %v because it's destroyed by user", r.task.Name)
-			r.setState(structs.TaskStateDead, structs.NewTaskEvent(structs.TaskKilled))
+			r.logger.Printf("[DEBUG] client: Not restarting task: %v because it has been destroyed due to: %s", r.task.Name, r.destroyEvent.Message)
+			r.setState(structs.TaskStateDead, r.destroyEvent)
 			return
 		}
 
@@ -456,22 +464,20 @@ func (r *TaskRunner) run() {
 	}
 }
 
-// startTask creates the driver and start the task.
+// startTask creates the driver and starts the task.
 func (r *TaskRunner) startTask() error {
 	// Create a driver
 	driver, err := r.createDriver()
 	if err != nil {
-		r.logger.Printf("[ERR] client: failed to create driver of task '%s' for alloc '%s': %v",
+		return fmt.Errorf("failed to create driver of task '%s' for alloc '%s': %v",
 			r.task.Name, r.alloc.ID, err)
-		return err
 	}
 
 	// Start the job
 	handle, err := driver.Start(r.ctx, r.task)
 	if err != nil {
-		r.logger.Printf("[ERR] client: failed to start task '%s' for alloc '%s': %v",
+		return fmt.Errorf("failed to start task '%s' for alloc '%s': %v",
 			r.task.Name, r.alloc.ID, err)
-		return err
 	}
 
 	r.handleLock.Lock()
@@ -506,7 +512,9 @@ func (r *TaskRunner) collectResourceUsageStats(stopCollection <-chan struct{}) {
 			r.resourceUsageLock.Lock()
 			r.resourceUsage = ru
 			r.resourceUsageLock.Unlock()
-			r.emitStats(ru)
+			if ru != nil {
+				r.emitStats(ru)
+			}
 		case <-stopCollection:
 			return
 		}
@@ -615,8 +623,9 @@ func (r *TaskRunner) Update(update *structs.Allocation) {
 	}
 }
 
-// Destroy is used to indicate that the task context should be destroyed
-func (r *TaskRunner) Destroy() {
+// Destroy is used to indicate that the task context should be destroyed. The
+// event parameter provides a context for the destroy.
+func (r *TaskRunner) Destroy(event *structs.TaskEvent) {
 	r.destroyLock.Lock()
 	defer r.destroyLock.Unlock()
 
@@ -624,13 +633,14 @@ func (r *TaskRunner) Destroy() {
 		return
 	}
 	r.destroy = true
+	r.destroyEvent = event
 	close(r.destroyCh)
 }
 
 // emitStats emits resource usage stats of tasks to remote metrics collector
 // sinks
 func (r *TaskRunner) emitStats(ru *cstructs.TaskResourceUsage) {
-	if ru.ResourceUsage.MemoryStats != nil {
+	if ru.ResourceUsage.MemoryStats != nil && r.config.PublishAllocationMetrics {
 		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "memory", "rss"}, float32(ru.ResourceUsage.MemoryStats.RSS))
 		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "memory", "cache"}, float32(ru.ResourceUsage.MemoryStats.Cache))
 		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "memory", "swap"}, float32(ru.ResourceUsage.MemoryStats.Swap))
@@ -639,7 +649,7 @@ func (r *TaskRunner) emitStats(ru *cstructs.TaskResourceUsage) {
 		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "memory", "kernel_max_usage"}, float32(ru.ResourceUsage.MemoryStats.KernelMaxUsage))
 	}
 
-	if ru.ResourceUsage.CpuStats != nil {
+	if ru.ResourceUsage.CpuStats != nil && r.config.PublishAllocationMetrics {
 		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "cpu", "total_percent"}, float32(ru.ResourceUsage.CpuStats.Percent))
 		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "cpu", "system"}, float32(ru.ResourceUsage.CpuStats.SystemMode))
 		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "cpu", "user"}, float32(ru.ResourceUsage.CpuStats.UserMode))
@@ -647,6 +657,4 @@ func (r *TaskRunner) emitStats(ru *cstructs.TaskResourceUsage) {
 		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "cpu", "throttled_periods"}, float32(ru.ResourceUsage.CpuStats.ThrottledPeriods))
 		metrics.SetGauge([]string{"client", "allocs", r.alloc.Job.Name, r.alloc.TaskGroup, r.alloc.ID, r.task.Name, "cpu", "total_ticks"}, float32(ru.ResourceUsage.CpuStats.TotalTicks))
 	}
-
-	//TODO Add Pid stats when we add an API to enable/disable them
 }

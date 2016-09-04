@@ -21,9 +21,13 @@ import (
 )
 
 func TestExecDriver_Fingerprint(t *testing.T) {
-	t.Parallel()
 	ctestutils.ExecCompatible(t)
-	driverCtx, _ := testDriverContexts(&structs.Task{Name: "foo"})
+	task := &structs.Task{
+		Name:      "foo",
+		Resources: structs.DefaultResources(),
+	}
+	driverCtx, execCtx := testDriverContexts(task)
+	defer execCtx.AllocDir.Destroy()
 	d := NewExecDriver(driverCtx)
 	node := &structs.Node{
 		Attributes: map[string]string{
@@ -43,7 +47,6 @@ func TestExecDriver_Fingerprint(t *testing.T) {
 }
 
 func TestExecDriver_StartOpen_Wait(t *testing.T) {
-	t.Parallel()
 	ctestutils.ExecCompatible(t)
 	task := &structs.Task{
 		Name: "sleep",
@@ -84,7 +87,6 @@ func TestExecDriver_StartOpen_Wait(t *testing.T) {
 }
 
 func TestExecDriver_KillUserPid_OnPluginReconnectFailure(t *testing.T) {
-	t.Parallel()
 	ctestutils.ExecCompatible(t)
 	task := &structs.Task{
 		Name: "sleep",
@@ -145,7 +147,6 @@ func TestExecDriver_KillUserPid_OnPluginReconnectFailure(t *testing.T) {
 }
 
 func TestExecDriver_Start_Wait(t *testing.T) {
-	t.Parallel()
 	ctestutils.ExecCompatible(t)
 	task := &structs.Task{
 		Name: "sleep",
@@ -190,7 +191,6 @@ func TestExecDriver_Start_Wait(t *testing.T) {
 }
 
 func TestExecDriver_Start_Wait_AllocDir(t *testing.T) {
-	t.Parallel()
 	ctestutils.ExecCompatible(t)
 
 	exp := []byte{'w', 'i', 'n'}
@@ -246,7 +246,6 @@ func TestExecDriver_Start_Wait_AllocDir(t *testing.T) {
 }
 
 func TestExecDriver_Start_Kill_Wait(t *testing.T) {
-	t.Parallel()
 	ctestutils.ExecCompatible(t)
 	task := &structs.Task{
 		Name: "sleep",
@@ -294,7 +293,6 @@ func TestExecDriver_Start_Kill_Wait(t *testing.T) {
 }
 
 func TestExecDriverUser(t *testing.T) {
-	t.Parallel()
 	ctestutils.ExecCompatible(t)
 	task := &structs.Task{
 		Name: "sleep",

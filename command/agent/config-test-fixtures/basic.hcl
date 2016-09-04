@@ -33,6 +33,10 @@ client {
 		foo = "bar"
 		baz = "zip"
 	}
+	chroot_env {
+		"/opt/myapp/etc" = "/etc"
+		"/opt/myapp/bin" = "/bin"
+	}
 	network_interface = "eth0"
 	network_speed = 100
 	reserved {
@@ -70,6 +74,8 @@ telemetry {
 	statsd_address = "127.0.0.1:2345"
 	disable_hostname = true
     collection_interval = "3s"
+    publish_allocation_metrics = true
+    publish_node_metrics = true
 }
 leave_on_interrupt = true
 leave_on_terminate = true
@@ -100,4 +106,17 @@ consul {
     server_auto_join = false
     client_auto_join = false
     auto_advertise = false
+}
+vault {
+    address = "127.0.0.1:9500"
+    allow_unauthenticated = true
+    task_token_ttl = "1s"
+    enabled = false
+    token = "12345"
+    tls_ca_file = "/path/to/ca/file"
+    tls_ca_path = "/path/to/ca"
+    tls_cert_file = "/path/to/cert/file"
+    tls_key_file = "/path/to/key/file"
+    tls_server_name = "foobar"
+    tls_skip_verify = true
 }

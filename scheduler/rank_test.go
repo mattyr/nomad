@@ -68,16 +68,20 @@ func TestBinPackIterator_NoExistingAlloc(t *testing.T) {
 	}
 	static := NewStaticRankIterator(ctx, nodes)
 
-	task := &structs.Task{
-		Name: "web",
-		Resources: &structs.Resources{
-			CPU:      1024,
-			MemoryMB: 1024,
+	taskGroup := &structs.TaskGroup{
+		LocalDisk: &structs.LocalDisk{},
+		Tasks: []*structs.Task{
+			{
+				Name: "web",
+				Resources: &structs.Resources{
+					CPU:      1024,
+					MemoryMB: 1024,
+				},
+			},
 		},
 	}
-
 	binp := NewBinPackIterator(ctx, static, false, 0)
-	binp.SetTasks([]*structs.Task{task})
+	binp.SetTaskGroup(taskGroup)
 
 	out := collectRanked(binp)
 	if len(out) != 2 {
@@ -142,16 +146,21 @@ func TestBinPackIterator_PlannedAlloc(t *testing.T) {
 		},
 	}
 
-	task := &structs.Task{
-		Name: "web",
-		Resources: &structs.Resources{
-			CPU:      1024,
-			MemoryMB: 1024,
+	taskGroup := &structs.TaskGroup{
+		LocalDisk: &structs.LocalDisk{},
+		Tasks: []*structs.Task{
+			{
+				Name: "web",
+				Resources: &structs.Resources{
+					CPU:      1024,
+					MemoryMB: 1024,
+				},
+			},
 		},
 	}
 
 	binp := NewBinPackIterator(ctx, static, false, 0)
-	binp.SetTasks([]*structs.Task{task})
+	binp.SetTaskGroup(taskGroup)
 
 	out := collectRanked(binp)
 	if len(out) != 1 {
@@ -204,6 +213,7 @@ func TestBinPackIterator_ExistingAlloc(t *testing.T) {
 		},
 		DesiredStatus: structs.AllocDesiredStatusRun,
 		ClientStatus:  structs.AllocClientStatusPending,
+		TaskGroup:     "web",
 	}
 	alloc2 := &structs.Allocation{
 		ID:     structs.GenerateUUID(),
@@ -216,19 +226,26 @@ func TestBinPackIterator_ExistingAlloc(t *testing.T) {
 		},
 		DesiredStatus: structs.AllocDesiredStatusRun,
 		ClientStatus:  structs.AllocClientStatusPending,
+		TaskGroup:     "web",
 	}
+	noErr(t, state.UpsertJobSummary(998, mock.JobSummary(alloc1.JobID)))
+	noErr(t, state.UpsertJobSummary(999, mock.JobSummary(alloc2.JobID)))
 	noErr(t, state.UpsertAllocs(1000, []*structs.Allocation{alloc1, alloc2}))
 
-	task := &structs.Task{
-		Name: "web",
-		Resources: &structs.Resources{
-			CPU:      1024,
-			MemoryMB: 1024,
+	taskGroup := &structs.TaskGroup{
+		LocalDisk: &structs.LocalDisk{},
+		Tasks: []*structs.Task{
+			{
+				Name: "web",
+				Resources: &structs.Resources{
+					CPU:      1024,
+					MemoryMB: 1024,
+				},
+			},
 		},
 	}
-
 	binp := NewBinPackIterator(ctx, static, false, 0)
-	binp.SetTasks([]*structs.Task{task})
+	binp.SetTaskGroup(taskGroup)
 
 	out := collectRanked(binp)
 	if len(out) != 1 {
@@ -280,6 +297,7 @@ func TestBinPackIterator_ExistingAlloc_PlannedEvict(t *testing.T) {
 		},
 		DesiredStatus: structs.AllocDesiredStatusRun,
 		ClientStatus:  structs.AllocClientStatusPending,
+		TaskGroup:     "web",
 	}
 	alloc2 := &structs.Allocation{
 		ID:     structs.GenerateUUID(),
@@ -292,23 +310,31 @@ func TestBinPackIterator_ExistingAlloc_PlannedEvict(t *testing.T) {
 		},
 		DesiredStatus: structs.AllocDesiredStatusRun,
 		ClientStatus:  structs.AllocClientStatusPending,
+		TaskGroup:     "web",
 	}
+	noErr(t, state.UpsertJobSummary(998, mock.JobSummary(alloc1.JobID)))
+	noErr(t, state.UpsertJobSummary(999, mock.JobSummary(alloc2.JobID)))
 	noErr(t, state.UpsertAllocs(1000, []*structs.Allocation{alloc1, alloc2}))
 
 	// Add a planned eviction to alloc1
 	plan := ctx.Plan()
 	plan.NodeUpdate[nodes[0].Node.ID] = []*structs.Allocation{alloc1}
 
-	task := &structs.Task{
-		Name: "web",
-		Resources: &structs.Resources{
-			CPU:      1024,
-			MemoryMB: 1024,
+	taskGroup := &structs.TaskGroup{
+		LocalDisk: &structs.LocalDisk{},
+		Tasks: []*structs.Task{
+			{
+				Name: "web",
+				Resources: &structs.Resources{
+					CPU:      1024,
+					MemoryMB: 1024,
+				},
+			},
 		},
 	}
 
 	binp := NewBinPackIterator(ctx, static, false, 0)
-	binp.SetTasks([]*structs.Task{task})
+	binp.SetTaskGroup(taskGroup)
 
 	out := collectRanked(binp)
 	if len(out) != 2 {

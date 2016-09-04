@@ -85,6 +85,42 @@ func (s *StateStore) StopWatch(items watch.Items, notify chan struct{}) {
 	s.watch.stopWatch(items, notify)
 }
 
+// UpsertJobSummary upserts a job summary into the state store.
+func (s *StateStore) UpsertJobSummary(index uint64, jobSummary *structs.JobSummary) error {
+	txn := s.db.Txn(true)
+	defer txn.Abort()
+
+	// Update the index
+	if err := txn.Insert("job_summary", *jobSummary); err != nil {
+		return err
+	}
+
+	// Update the indexes table for job summary
+	if err := txn.Insert("index", &IndexEntry{"job_summary", index}); err != nil {
+		return fmt.Errorf("index update failed: %v", err)
+	}
+
+	txn.Commit()
+	return nil
+}
+
+// DeleteJobSummary deletes the job summary with the given ID. This is for
+// testing purposes only.
+func (s *StateStore) DeleteJobSummary(index uint64, id string) error {
+	txn := s.db.Txn(true)
+	defer txn.Abort()
+
+	// Delete the job summary
+	if _, err := txn.DeleteAll("job_summary", "id", id); err != nil {
+		return fmt.Errorf("deleting job summary failed: %v", err)
+	}
+	if err := txn.Insert("index", &IndexEntry{"job_summary", index}); err != nil {
+		return fmt.Errorf("index update failed: %v", err)
+	}
+	txn.Commit()
+	return nil
+}
+
 // UpsertNode is used to register a node or update a node definition
 // This is assumed to be triggered by the client, so we retain the value
 // of drain which is set by the scheduler.
@@ -190,25 +226,6 @@ func (s *StateStore) UpdateNodeStatus(index uint64, nodeID, status string) error
 	}
 	if err := txn.Insert("index", &IndexEntry{"nodes", index}); err != nil {
 		return fmt.Errorf("index update failed: %v", err)
-	}
-
-	// Update the state of the allocations which are in running state to lost
-	if status == structs.NodeStatusDown {
-		allocs, err := s.AllocsByNode(nodeID)
-		if err != nil {
-			return fmt.Errorf("error retrieving any allocations for the node: %v", nodeID)
-		}
-		for _, alloc := range allocs {
-			copyAlloc := new(structs.Allocation)
-			*copyAlloc = *alloc
-			if alloc.ClientStatus == structs.AllocClientStatusPending ||
-				alloc.ClientStatus == structs.AllocClientStatusRunning {
-				copyAlloc.ClientStatus = structs.AllocClientStatusLost
-				if err := txn.Insert("allocs", copyAlloc); err != nil {
-					return fmt.Errorf("alloc insert failed: %v", err)
-				}
-			}
-		}
 	}
 
 	txn.Defer(func() { s.watch.notify(watcher) })
@@ -336,17 +353,20 @@ func (s *StateStore) UpsertJob(index uint64, job *structs.Job) error {
 		}
 	}
 
+	if err := s.updateSummaryWithJob(index, job, watcher, txn); err != nil {
+		return fmt.Errorf("unable to create job summary: %v", err)
+	}
+
+	// Create the LocalDisk if it's nil by adding up DiskMB from task resources.
+	// COMPAT 0.4.1 -> 0.5
+	s.addLocalDiskToTaskGroups(job)
+
 	// Insert the job
 	if err := txn.Insert("jobs", job); err != nil {
 		return fmt.Errorf("job insert failed: %v", err)
 	}
 	if err := txn.Insert("index", &IndexEntry{"jobs", index}); err != nil {
 		return fmt.Errorf("index update failed: %v", err)
-	}
-
-	// Update the job summary
-	if err := s.updateSummaryWithJob(job, txn); err != nil {
-		return fmt.Errorf("job summary update failed: %v", err)
 	}
 
 	txn.Defer(func() { s.watch.notify(watcher) })
@@ -371,6 +391,8 @@ func (s *StateStore) DeleteJob(index uint64, jobID string) error {
 	watcher := watch.NewItems()
 	watcher.Add(watch.Item{Table: "jobs"})
 	watcher.Add(watch.Item{Job: jobID})
+	watcher.Add(watch.Item{Table: "job_summary"})
+	watcher.Add(watch.Item{JobSummary: jobID})
 
 	// Delete the node
 	if err := txn.Delete("jobs", existing); err != nil {
@@ -383,6 +405,9 @@ func (s *StateStore) DeleteJob(index uint64, jobID string) error {
 	// Delete the job summary
 	if _, err = txn.DeleteAll("job_summary", "id", jobID); err != nil {
 		return fmt.Errorf("deleing job summary failed: %v", err)
+	}
+	if err := txn.Insert("index", &IndexEntry{"job_summary", index}); err != nil {
+		return fmt.Errorf("index update failed: %v", err)
 	}
 
 	txn.Defer(func() { s.watch.notify(watcher) })
@@ -474,7 +499,8 @@ func (s *StateStore) JobSummaryByID(jobID string) (*structs.JobSummary, error) {
 		return nil, err
 	}
 	if existing != nil {
-		return existing.(*structs.JobSummary), nil
+		summary := existing.(structs.JobSummary)
+		return summary.Copy(), nil
 	}
 
 	return nil, nil
@@ -644,6 +670,38 @@ func (s *StateStore) nestedUpsertEval(txn *memdb.Txn, index uint64, eval *struct
 	} else {
 		eval.CreateIndex = index
 		eval.ModifyIndex = index
+	}
+
+	// Update the job summary
+	summaryRaw, err := txn.First("job_summary", "id", eval.JobID)
+	if err != nil {
+		return fmt.Errorf("job summary lookup failed: %v", err)
+	}
+	if summaryRaw != nil {
+		js := summaryRaw.(structs.JobSummary)
+		var hasSummaryChanged bool
+		for tg, num := range eval.QueuedAllocations {
+			if summary, ok := js.Summary[tg]; ok {
+				if summary.Queued != num {
+					summary.Queued = num
+					js.Summary[tg] = summary
+					hasSummaryChanged = true
+				}
+			} else {
+				s.logger.Printf("[ERR] state_store: unable to update queued for job %q and task group %q", eval.JobID, tg)
+			}
+		}
+
+		// Insert the job summary
+		if hasSummaryChanged {
+			js.ModifyIndex = index
+			if err := txn.Insert("job_summary", js); err != nil {
+				return fmt.Errorf("job summary insert failed: %v", err)
+			}
+			if err := txn.Insert("index", &IndexEntry{"job_summary", index}); err != nil {
+				return fmt.Errorf("index update failed: %v", err)
+			}
+		}
 	}
 
 	// Insert the eval
@@ -820,12 +878,6 @@ func (s *StateStore) nestedUpdateAllocFromClient(txn *memdb.Txn, watcher watch.I
 		return nil
 	}
 	exist := existing.(*structs.Allocation)
-
-	// Update the job summary
-	if err := s.updateSummaryWithAlloc(alloc, exist, txn); err != nil {
-		return fmt.Errorf("unable to update job summary: %v", err)
-	}
-
 	// Trigger the watcher
 	watcher.Add(watch.Item{Alloc: alloc.ID})
 	watcher.Add(watch.Item{AllocEval: exist.EvalID})
@@ -843,6 +895,10 @@ func (s *StateStore) nestedUpdateAllocFromClient(txn *memdb.Txn, watcher watch.I
 
 	// Update the modify index
 	copyAlloc.ModifyIndex = index
+
+	if err := s.updateSummaryWithAlloc(index, copyAlloc, exist, watcher, txn); err != nil {
+		return fmt.Errorf("error updating job summary: %v", err)
+	}
 
 	// Update the allocation
 	if err := txn.Insert("allocs", copyAlloc); err != nil {
@@ -877,11 +933,8 @@ func (s *StateStore) UpsertAllocs(index uint64, allocs []*structs.Allocation) er
 		if err != nil {
 			return fmt.Errorf("alloc lookup failed: %v", err)
 		}
-
 		exist, _ := existing.(*structs.Allocation)
-		if err := s.updateSummaryWithAlloc(alloc, exist, txn); err != nil {
-			return fmt.Errorf("updating job summary failed: %v", err)
-		}
+
 		if exist == nil {
 			alloc.CreateIndex = index
 			alloc.ModifyIndex = index
@@ -890,9 +943,30 @@ func (s *StateStore) UpsertAllocs(index uint64, allocs []*structs.Allocation) er
 			alloc.CreateIndex = exist.CreateIndex
 			alloc.ModifyIndex = index
 			alloc.AllocModifyIndex = index
-			alloc.ClientStatus = exist.ClientStatus
-			alloc.ClientDescription = exist.ClientDescription
+
+			// If the scheduler is marking this allocation as lost we do not
+			// want to reuse the status of the existing allocation.
+			if alloc.ClientStatus != structs.AllocClientStatusLost {
+				alloc.ClientStatus = exist.ClientStatus
+				alloc.ClientDescription = exist.ClientDescription
+			}
+
+			// The job has been denormalized so re-attach the original job
+			if alloc.Job == nil {
+				alloc.Job = exist.Job
+			}
 		}
+
+		if err := s.updateSummaryWithAlloc(index, alloc, exist, watcher, txn); err != nil {
+			return fmt.Errorf("error updating job summary: %v", err)
+		}
+
+		// Create the LocalDisk if it's nil by adding up DiskMB from task resources.
+		// COMPAT 0.4.1 -> 0.5
+		if alloc.Job != nil {
+			s.addLocalDiskToTaskGroups(alloc.Job)
+		}
+
 		if err := txn.Insert("allocs", alloc); err != nil {
 			return fmt.Errorf("alloc insert failed: %v", err)
 		}
@@ -1049,6 +1123,119 @@ func (s *StateStore) Allocs() (memdb.ResultIterator, error) {
 	return iter, nil
 }
 
+// UpsertVaultAccessors is used to register a set of Vault Accessors
+func (s *StateStore) UpsertVaultAccessor(index uint64, accessors []*structs.VaultAccessor) error {
+	txn := s.db.Txn(true)
+	defer txn.Abort()
+
+	for _, accessor := range accessors {
+		// Set the create index
+		accessor.CreateIndex = index
+
+		// Insert the accessor
+		if err := txn.Insert("vault_accessors", accessor); err != nil {
+			return fmt.Errorf("accessor insert failed: %v", err)
+		}
+	}
+
+	if err := txn.Insert("index", &IndexEntry{"vault_accessors", index}); err != nil {
+		return fmt.Errorf("index update failed: %v", err)
+	}
+
+	txn.Commit()
+	return nil
+}
+
+// DeleteVaultAccessors is used to delete a set of Vault Accessors
+func (s *StateStore) DeleteVaultAccessors(index uint64, accessors []*structs.VaultAccessor) error {
+	txn := s.db.Txn(true)
+	defer txn.Abort()
+
+	// Lookup the accessor
+	for _, accessor := range accessors {
+		// Delete the accessor
+		if err := txn.Delete("vault_accessors", accessor); err != nil {
+			return fmt.Errorf("accessor delete failed: %v", err)
+		}
+	}
+
+	if err := txn.Insert("index", &IndexEntry{"vault_accessors", index}); err != nil {
+		return fmt.Errorf("index update failed: %v", err)
+	}
+
+	txn.Commit()
+	return nil
+}
+
+// VaultAccessor returns the given Vault accessor
+func (s *StateStore) VaultAccessor(accessor string) (*structs.VaultAccessor, error) {
+	txn := s.db.Txn(false)
+
+	existing, err := txn.First("vault_accessors", "id", accessor)
+	if err != nil {
+		return nil, fmt.Errorf("accessor lookup failed: %v", err)
+	}
+
+	if existing != nil {
+		return existing.(*structs.VaultAccessor), nil
+	}
+
+	return nil, nil
+}
+
+// VaultAccessors returns an iterator of Vault accessors.
+func (s *StateStore) VaultAccessors() (memdb.ResultIterator, error) {
+	txn := s.db.Txn(false)
+
+	iter, err := txn.Get("vault_accessors", "id")
+	if err != nil {
+		return nil, err
+	}
+	return iter, nil
+}
+
+// VaultAccessorsByAlloc returns all the Vault accessors by alloc id
+func (s *StateStore) VaultAccessorsByAlloc(allocID string) ([]*structs.VaultAccessor, error) {
+	txn := s.db.Txn(false)
+
+	// Get an iterator over the accessors
+	iter, err := txn.Get("vault_accessors", "alloc_id", allocID)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []*structs.VaultAccessor
+	for {
+		raw := iter.Next()
+		if raw == nil {
+			break
+		}
+		out = append(out, raw.(*structs.VaultAccessor))
+	}
+	return out, nil
+}
+
+// VaultAccessorsByNode returns all the Vault accessors by node id
+func (s *StateStore) VaultAccessorsByNode(nodeID string) ([]*structs.VaultAccessor, error) {
+	txn := s.db.Txn(false)
+
+	// Get an iterator over the accessors
+	iter, err := txn.Get("vault_accessors", "node_id", nodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []*structs.VaultAccessor
+	for {
+		raw := iter.Next()
+		if raw == nil {
+			break
+		}
+		out = append(out, raw.(*structs.VaultAccessor))
+	}
+	return out, nil
+}
+
 // LastIndex returns the greatest index value for all indexes
 func (s *StateStore) LatestIndex() (uint64, error) {
 	indexes, err := s.Indexes()
@@ -1090,6 +1277,19 @@ func (s *StateStore) Index(name string) (uint64, error) {
 	return out.(*IndexEntry).Value, nil
 }
 
+// RemoveIndex is a helper method to remove an index for testing purposes
+func (s *StateStore) RemoveIndex(name string) error {
+	txn := s.db.Txn(true)
+	defer txn.Abort()
+
+	if _, err := txn.DeleteAll("index", "id", name); err != nil {
+		return err
+	}
+
+	txn.Commit()
+	return nil
+}
+
 // Indexes returns an iterator over all the indexes
 func (s *StateStore) Indexes() (memdb.ResultIterator, error) {
 	txn := s.db.Txn(false)
@@ -1100,6 +1300,90 @@ func (s *StateStore) Indexes() (memdb.ResultIterator, error) {
 		return nil, err
 	}
 	return iter, nil
+}
+
+// ReconcileJobSummaries re-creates summaries for all jobs present in the state
+// store
+func (s *StateStore) ReconcileJobSummaries(index uint64) error {
+	txn := s.db.Txn(true)
+	defer txn.Abort()
+
+	// Get all the jobs
+	iter, err := txn.Get("jobs", "id")
+	if err != nil {
+		return err
+	}
+	for {
+		rawJob := iter.Next()
+		if rawJob == nil {
+			break
+		}
+		job := rawJob.(*structs.Job)
+
+		// Create a job summary for the job
+		summary := structs.JobSummary{
+			JobID:   job.ID,
+			Summary: make(map[string]structs.TaskGroupSummary),
+		}
+		for _, tg := range job.TaskGroups {
+			summary.Summary[tg.Name] = structs.TaskGroupSummary{}
+		}
+
+		// Find all the allocations for the jobs
+		iterAllocs, err := txn.Get("allocs", "job", job.ID)
+		if err != nil {
+			return err
+		}
+
+		// Calculate the summary for the job
+		for {
+			rawAlloc := iterAllocs.Next()
+			if rawAlloc == nil {
+				break
+			}
+			alloc := rawAlloc.(*structs.Allocation)
+
+			// Ignore the allocation if it doesn't belong to the currently
+			// registered job
+			if alloc.Job.CreateIndex != job.CreateIndex {
+				continue
+			}
+
+			tg := summary.Summary[alloc.TaskGroup]
+			switch alloc.ClientStatus {
+			case structs.AllocClientStatusFailed:
+				tg.Failed += 1
+			case structs.AllocClientStatusLost:
+				tg.Lost += 1
+			case structs.AllocClientStatusComplete:
+				tg.Complete += 1
+			case structs.AllocClientStatusRunning:
+				tg.Running += 1
+			case structs.AllocClientStatusPending:
+				tg.Starting += 1
+			default:
+				s.logger.Printf("[ERR] state_store: invalid client status: %v in allocation %q", alloc.ClientStatus, alloc.ID)
+			}
+			summary.Summary[alloc.TaskGroup] = tg
+		}
+
+		// Set the create index of the summary same as the job's create index
+		// and the modify index to the current index
+		summary.CreateIndex = job.CreateIndex
+		summary.ModifyIndex = index
+
+		// Insert the job summary
+		if err := txn.Insert("job_summary", summary); err != nil {
+			return fmt.Errorf("error inserting job summary: %v", err)
+		}
+	}
+
+	// Update the indexes table for job summary
+	if err := txn.Insert("index", &IndexEntry{"job_summary", index}); err != nil {
+		return fmt.Errorf("index update failed: %v", err)
+	}
+	txn.Commit()
+	return nil
 }
 
 // setJobStatuses is a helper for calling setJobStatus on multiple jobs by ID.
@@ -1215,16 +1499,21 @@ func (s *StateStore) getJobStatus(txn *memdb.Txn, job *structs.Job, evalDelete b
 
 // updateSummaryWithJob creates or updates job summaries when new jobs are
 // upserted or existing ones are updated
-func (s *StateStore) updateSummaryWithJob(job *structs.Job, txn *memdb.Txn) error {
+func (s *StateStore) updateSummaryWithJob(index uint64, job *structs.Job,
+	watcher watch.Items, txn *memdb.Txn) error {
+
 	existing, err := s.JobSummaryByID(job.ID)
 	if err != nil {
 		return fmt.Errorf("unable to retrieve summary for job: %v", err)
 	}
+	var hasSummaryChanged bool
 	if existing == nil {
 		existing = &structs.JobSummary{
-			JobID:   job.ID,
-			Summary: make(map[string]structs.TaskGroupSummary),
+			JobID:       job.ID,
+			Summary:     make(map[string]structs.TaskGroupSummary),
+			CreateIndex: index,
 		}
+		hasSummaryChanged = true
 	}
 	for _, tg := range job.TaskGroups {
 		if _, ok := existing.Summary[tg.Name]; !ok {
@@ -1235,53 +1524,91 @@ func (s *StateStore) updateSummaryWithJob(job *structs.Job, txn *memdb.Txn) erro
 				Starting: 0,
 			}
 			existing.Summary[tg.Name] = newSummary
+			hasSummaryChanged = true
 		}
 	}
 
-	if err := txn.Insert("job_summary", existing); err != nil {
-		return err
+	// The job summary has changed, so add to watcher and update the modify
+	// index.
+	if hasSummaryChanged {
+		existing.ModifyIndex = index
+		watcher.Add(watch.Item{Table: "job_summary"})
+		watcher.Add(watch.Item{JobSummary: job.ID})
+
+		// Update the indexes table for job summary
+		if err := txn.Insert("index", &IndexEntry{"job_summary", index}); err != nil {
+			return fmt.Errorf("index update failed: %v", err)
+		}
+		if err := txn.Insert("job_summary", *existing); err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
 // updateSummaryWithAlloc updates the job summary when allocations are updated
 // or inserted
-func (s *StateStore) updateSummaryWithAlloc(newAlloc *structs.Allocation,
-	existingAlloc *structs.Allocation, txn *memdb.Txn) error {
+func (s *StateStore) updateSummaryWithAlloc(index uint64, alloc *structs.Allocation,
+	existingAlloc *structs.Allocation, watcher watch.Items, txn *memdb.Txn) error {
 
-	existing, err := s.JobSummaryByID(newAlloc.JobID)
+	// We don't have to update the summary if the job is missing
+	if alloc.Job == nil {
+		return nil
+	}
+
+	summaryRaw, err := txn.First("job_summary", "id", alloc.JobID)
 	if err != nil {
-		return fmt.Errorf("lookup of job summary failed: %v", err)
+		return fmt.Errorf("unable to lookup job summary for job id %q: %v", err)
 	}
-
-	// If we can't find an existing job summary entry then we are not going to create a
-	// new job summary entry for an allocation with that job id since we don't
-	// know the task group counts for that job
-	// TODO May be we can query the job and scan all the allocations for that
-	// job and create the summary before applying the change of summary state
-	// that this allocation would cause.
-	if existing == nil {
-		return nil
-	}
-
-	tgSummary, ok := existing.Summary[newAlloc.TaskGroup]
-	if !ok {
-		return nil
-	}
-	if existingAlloc == nil {
-		switch newAlloc.DesiredStatus {
-		case structs.AllocDesiredStatusStop, structs.AllocDesiredStatusEvict:
-			s.logger.Printf("[WARN]: new allocation inserted into state store with id: %v and state: %v", newAlloc.DesiredStatus)
+	if summaryRaw == nil {
+		// Check if the job is de-registered
+		rawJob, err := txn.First("jobs", "id", alloc.JobID)
+		if err != nil {
+			return fmt.Errorf("unable to query job: %v", err)
 		}
-		switch newAlloc.ClientStatus {
+
+		// If the job is de-registered then we skip updating it's summary
+		if rawJob == nil {
+			return nil
+		}
+		return fmt.Errorf("job summary for job %q is not present", alloc.JobID)
+	}
+	summary := summaryRaw.(structs.JobSummary)
+	jobSummary := summary.Copy()
+
+	// Not updating the job summary because the allocation doesn't belong to the
+	// currently registered job
+	if jobSummary.CreateIndex != alloc.Job.CreateIndex {
+		return nil
+	}
+
+	tgSummary, ok := jobSummary.Summary[alloc.TaskGroup]
+	if !ok {
+		return fmt.Errorf("unable to find task group in the job summary: %v", alloc.TaskGroup)
+	}
+	var summaryChanged bool
+	if existingAlloc == nil {
+		switch alloc.DesiredStatus {
+		case structs.AllocDesiredStatusStop, structs.AllocDesiredStatusEvict:
+			s.logger.Printf("[ERR] state_store: new allocation inserted into state store with id: %v and state: %v",
+				alloc.ID, alloc.DesiredStatus)
+		}
+		switch alloc.ClientStatus {
 		case structs.AllocClientStatusPending:
 			tgSummary.Starting += 1
-		case structs.AllocClientStatusRunning, structs.AllocClientStatusFailed, structs.AllocClientStatusComplete:
-			s.logger.Printf("[WARN]: new allocation inserted into state store with id: %v and state: %v", newAlloc.ClientStatus)
+			if tgSummary.Queued > 0 {
+				tgSummary.Queued -= 1
+			}
+			summaryChanged = true
+		case structs.AllocClientStatusRunning, structs.AllocClientStatusFailed,
+			structs.AllocClientStatusComplete:
+			s.logger.Printf("[ERR] state_store: new allocation inserted into state store with id: %v and state: %v",
+				alloc.ID, alloc.ClientStatus)
 		}
-	} else if existingAlloc.ClientStatus != newAlloc.ClientStatus {
+	} else if existingAlloc.ClientStatus != alloc.ClientStatus {
 		// Incrementing the client of the bin of the current state
-		switch newAlloc.ClientStatus {
+		switch alloc.ClientStatus {
 		case structs.AllocClientStatusRunning:
 			tgSummary.Running += 1
 		case structs.AllocClientStatusFailed:
@@ -1298,22 +1625,54 @@ func (s *StateStore) updateSummaryWithAlloc(newAlloc *structs.Allocation,
 		switch existingAlloc.ClientStatus {
 		case structs.AllocClientStatusRunning:
 			tgSummary.Running -= 1
-		case structs.AllocClientStatusFailed:
-			tgSummary.Failed -= 1
 		case structs.AllocClientStatusPending:
 			tgSummary.Starting -= 1
-		case structs.AllocClientStatusComplete:
-			tgSummary.Complete -= 1
 		case structs.AllocClientStatusLost:
 			tgSummary.Lost -= 1
+		case structs.AllocClientStatusFailed, structs.AllocClientStatusComplete:
+		default:
+			s.logger.Printf("[ERR] state_store: invalid old state of allocation with id: %v, and state: %v",
+				existingAlloc.ID, existingAlloc.ClientStatus)
+		}
+		summaryChanged = true
+	}
+	jobSummary.Summary[alloc.TaskGroup] = tgSummary
+
+	if summaryChanged {
+		jobSummary.ModifyIndex = index
+		watcher.Add(watch.Item{Table: "job_summary"})
+		watcher.Add(watch.Item{JobSummary: alloc.JobID})
+
+		// Update the indexes table for job summary
+		if err := txn.Insert("index", &IndexEntry{"job_summary", index}); err != nil {
+			return fmt.Errorf("index update failed: %v", err)
+		}
+
+		if err := txn.Insert("job_summary", *jobSummary); err != nil {
+			return fmt.Errorf("updating job summary failed: %v", err)
 		}
 	}
 
-	existing.Summary[newAlloc.TaskGroup] = tgSummary
-	if err := txn.Insert("job_summary", existing); err != nil {
-		return fmt.Errorf("inserting job summary failed: %v", err)
-	}
 	return nil
+}
+
+// addLocalDiskToTaskGroups adds missing LocalDisk objects to TaskGroups
+func (s *StateStore) addLocalDiskToTaskGroups(job *structs.Job) {
+	for _, tg := range job.TaskGroups {
+		if tg.LocalDisk != nil {
+			continue
+		}
+		var diskMB int
+		for _, task := range tg.Tasks {
+			if task.Resources != nil {
+				diskMB += task.Resources.DiskMB
+				task.Resources.DiskMB = 0
+			}
+		}
+		tg.LocalDisk = &structs.LocalDisk{
+			DiskMB: diskMB,
+		}
+	}
 }
 
 // StateSnapshot is used to provide a point-in-time snapshot
@@ -1355,6 +1714,11 @@ func (r *StateRestore) NodeRestore(node *structs.Node) error {
 func (r *StateRestore) JobRestore(job *structs.Job) error {
 	r.items.Add(watch.Item{Table: "jobs"})
 	r.items.Add(watch.Item{Job: job.ID})
+
+	// Create the LocalDisk if it's nil by adding up DiskMB from task resources.
+	// COMPAT 0.4.1 -> 0.5
+	r.addLocalDiskToTaskGroups(job)
+
 	if err := r.txn.Insert("jobs", job); err != nil {
 		return fmt.Errorf("job insert failed: %v", err)
 	}
@@ -1378,6 +1742,20 @@ func (r *StateRestore) AllocRestore(alloc *structs.Allocation) error {
 	r.items.Add(watch.Item{AllocEval: alloc.EvalID})
 	r.items.Add(watch.Item{AllocJob: alloc.JobID})
 	r.items.Add(watch.Item{AllocNode: alloc.NodeID})
+
+	// Set the shared resources if it's not present
+	// COMPAT 0.4.1 -> 0.5
+	if alloc.SharedResources == nil {
+		alloc.SharedResources = &structs.Resources{
+			DiskMB: alloc.Resources.DiskMB,
+		}
+	}
+
+	// Create the LocalDisk if it's nil by adding up DiskMB from task resources.
+	if alloc.Job != nil {
+		r.addLocalDiskToTaskGroups(alloc.Job)
+	}
+
 	if err := r.txn.Insert("allocs", alloc); err != nil {
 		return fmt.Errorf("alloc insert failed: %v", err)
 	}
@@ -1404,10 +1782,37 @@ func (r *StateRestore) PeriodicLaunchRestore(launch *structs.PeriodicLaunch) err
 
 // JobSummaryRestore is used to restore a job summary
 func (r *StateRestore) JobSummaryRestore(jobSummary *structs.JobSummary) error {
-	if err := r.txn.Insert("job_summary", jobSummary); err != nil {
+	if err := r.txn.Insert("job_summary", *jobSummary); err != nil {
 		return fmt.Errorf("job summary insert failed: %v", err)
 	}
 	return nil
+}
+
+// VaultAccessorRestore is used to restore a vault accessor
+func (r *StateRestore) VaultAccessorRestore(accessor *structs.VaultAccessor) error {
+	if err := r.txn.Insert("vault_accessors", accessor); err != nil {
+		return fmt.Errorf("vault accessor insert failed: %v", err)
+	}
+	return nil
+}
+
+// addLocalDiskToTaskGroups adds missing LocalDisk objects to TaskGroups
+func (r *StateRestore) addLocalDiskToTaskGroups(job *structs.Job) {
+	for _, tg := range job.TaskGroups {
+		if tg.LocalDisk != nil {
+			continue
+		}
+		var diskMB int
+		for _, task := range tg.Tasks {
+			if task.Resources != nil {
+				diskMB += task.Resources.DiskMB
+				task.Resources.DiskMB = 0
+			}
+		}
+		tg.LocalDisk = &structs.LocalDisk{
+			DiskMB: diskMB,
+		}
+	}
 }
 
 // stateWatch holds shared state for watching updates. This is

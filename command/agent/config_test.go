@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/nomad/structs/config"
 )
 
 func TestConfig_Merge(t *testing.T) {
@@ -27,9 +28,20 @@ func TestConfig_Merge(t *testing.T) {
 		DisableAnonymousSignature: false,
 		BindAddr:                  "127.0.0.1",
 		Telemetry: &Telemetry{
-			StatsiteAddr:    "127.0.0.1:8125",
-			StatsdAddr:      "127.0.0.1:8125",
-			DisableHostname: false,
+			StatsiteAddr:                       "127.0.0.1:8125",
+			StatsdAddr:                         "127.0.0.1:8125",
+			DisableHostname:                    false,
+			CirconusAPIToken:                   "0",
+			CirconusAPIApp:                     "nomadic",
+			CirconusAPIURL:                     "http://api.circonus.com/v2",
+			CirconusSubmissionInterval:         "60s",
+			CirconusCheckSubmissionURL:         "https://someplace.com/metrics",
+			CirconusCheckID:                    "0",
+			CirconusCheckForceMetricActivation: "true",
+			CirconusCheckInstanceID:            "node1:nomadic",
+			CirconusCheckSearchTag:             "service:nomadic",
+			CirconusBrokerID:                   "0",
+			CirconusBrokerSelectTag:            "dc:dc1",
 		},
 		Client: &ClientConfig{
 			Enabled:   false,
@@ -83,6 +95,34 @@ func TestConfig_Merge(t *testing.T) {
 		HTTPAPIResponseHeaders: map[string]string{
 			"Access-Control-Allow-Origin": "*",
 		},
+		Vault: &config.VaultConfig{
+			Token:                "1",
+			AllowUnauthenticated: false,
+			TaskTokenTTL:         "1",
+			Addr:                 "1",
+			TLSCaFile:            "1",
+			TLSCaPath:            "1",
+			TLSCertFile:          "1",
+			TLSKeyFile:           "1",
+			TLSSkipVerify:        false,
+			TLSServerName:        "1",
+		},
+		Consul: &config.ConsulConfig{
+			ServerServiceName: "1",
+			ClientServiceName: "1",
+			AutoAdvertise:     false,
+			Addr:              "1",
+			Timeout:           1 * time.Second,
+			Token:             "1",
+			Auth:              "1",
+			EnableSSL:         false,
+			VerifySSL:         false,
+			CAFile:            "1",
+			CertFile:          "1",
+			KeyFile:           "1",
+			ServerAutoJoin:    false,
+			ClientAutoJoin:    false,
+		},
 	}
 
 	c2 := &Config{
@@ -100,9 +140,22 @@ func TestConfig_Merge(t *testing.T) {
 		DisableAnonymousSignature: true,
 		BindAddr:                  "127.0.0.2",
 		Telemetry: &Telemetry{
-			StatsiteAddr:    "127.0.0.2:8125",
-			StatsdAddr:      "127.0.0.2:8125",
-			DisableHostname: true,
+			StatsiteAddr:                       "127.0.0.2:8125",
+			StatsdAddr:                         "127.0.0.2:8125",
+			DisableHostname:                    true,
+			PublishNodeMetrics:                 true,
+			PublishAllocationMetrics:           true,
+			CirconusAPIToken:                   "1",
+			CirconusAPIApp:                     "nomad",
+			CirconusAPIURL:                     "https://api.circonus.com/v2",
+			CirconusSubmissionInterval:         "10s",
+			CirconusCheckSubmissionURL:         "https://example.com/metrics",
+			CirconusCheckID:                    "1",
+			CirconusCheckForceMetricActivation: "false",
+			CirconusCheckInstanceID:            "node2:nomad",
+			CirconusCheckSearchTag:             "service:nomad",
+			CirconusBrokerID:                   "1",
+			CirconusBrokerSelectTag:            "dc:dc2",
 		},
 		Client: &ClientConfig{
 			Enabled:   true,
@@ -117,6 +170,7 @@ func TestConfig_Merge(t *testing.T) {
 				"foo": "bar",
 				"baz": "zip",
 			},
+			ChrootEnv:      map[string]string{},
 			ClientMaxPort:  20000,
 			ClientMinPort:  22000,
 			NetworkSpeed:   105,
@@ -168,6 +222,34 @@ func TestConfig_Merge(t *testing.T) {
 		HTTPAPIResponseHeaders: map[string]string{
 			"Access-Control-Allow-Origin":  "*",
 			"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+		},
+		Vault: &config.VaultConfig{
+			Token:                "2",
+			AllowUnauthenticated: true,
+			TaskTokenTTL:         "2",
+			Addr:                 "2",
+			TLSCaFile:            "2",
+			TLSCaPath:            "2",
+			TLSCertFile:          "2",
+			TLSKeyFile:           "2",
+			TLSSkipVerify:        true,
+			TLSServerName:        "2",
+		},
+		Consul: &config.ConsulConfig{
+			ServerServiceName: "2",
+			ClientServiceName: "2",
+			AutoAdvertise:     true,
+			Addr:              "2",
+			Timeout:           2 * time.Second,
+			Token:             "2",
+			Auth:              "2",
+			EnableSSL:         true,
+			VerifySSL:         true,
+			CAFile:            "2",
+			CertFile:          "2",
+			KeyFile:           "2",
+			ServerAutoJoin:    true,
+			ClientAutoJoin:    true,
 		},
 	}
 

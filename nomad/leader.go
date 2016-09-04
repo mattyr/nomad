@@ -1,6 +1,7 @@
 package nomad
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -132,6 +133,12 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 		return err
 	}
 
+	// Activate the vault client
+	s.vault.SetActive(true)
+	if err := s.restoreRevokingAccessors(); err != nil {
+		return err
+	}
+
 	// Enable the periodic dispatcher, since we are now the leader.
 	s.periodicDispatcher.SetEnabled(true)
 	s.periodicDispatcher.Start()
@@ -166,6 +173,15 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 		s.logger.Printf("[ERR] nomad: heartbeat timer setup failed: %v", err)
 		return err
 	}
+
+	// COMPAT 0.4 - 0.4.1
+	// Reconcile the summaries of the registered jobs. We reconcile summaries
+	// only if the server is 0.4.1 since summaries are not present in 0.4 they
+	// might be incorrect after upgrading to 0.4.1 the summaries might not be
+	// correct
+	if err := s.reconcileJobSummaries(); err != nil {
+		return fmt.Errorf("unable to reconcile job summaries: %v", err)
+	}
 	return nil
 }
 
@@ -193,6 +209,57 @@ func (s *Server) restoreEvals() error {
 			s.blockedEvals.Block(eval)
 		}
 	}
+	return nil
+}
+
+// restoreRevokingAccessors is used to restore Vault accessors that should be
+// revoked.
+func (s *Server) restoreRevokingAccessors() error {
+	// An accessor should be revoked if its allocation or node is terminal
+	state := s.fsm.State()
+	iter, err := state.VaultAccessors()
+	if err != nil {
+		return fmt.Errorf("failed to get vault accessors: %v", err)
+	}
+
+	var revoke []*structs.VaultAccessor
+	for {
+		raw := iter.Next()
+		if raw == nil {
+			break
+		}
+
+		va := raw.(*structs.VaultAccessor)
+
+		// Check the allocation
+		alloc, err := state.AllocByID(va.AllocID)
+		if err != nil {
+			return fmt.Errorf("failed to lookup allocation: %v", va.AllocID, err)
+		}
+		if alloc == nil || alloc.Terminated() {
+			// No longer running and should be revoked
+			revoke = append(revoke, va)
+			continue
+		}
+
+		// Check the node
+		node, err := state.NodeByID(va.NodeID)
+		if err != nil {
+			return fmt.Errorf("failed to lookup node %q: %v", va.NodeID, err)
+		}
+		if node == nil || node.TerminalStatus() {
+			// Node is terminal so any accessor from it should be revoked
+			revoke = append(revoke, va)
+			continue
+		}
+	}
+
+	if len(revoke) != 0 {
+		if err := s.vault.RevokeTokens(context.Background(), revoke, true); err != nil {
+			return fmt.Errorf("failed to revoke tokens: %v", err)
+		}
+	}
+
 	return nil
 }
 
@@ -400,6 +467,9 @@ func (s *Server) revokeLeadership() error {
 	// Disable the periodic dispatcher, since it is only useful as a leader
 	s.periodicDispatcher.SetEnabled(false)
 
+	// Disable the Vault client as it is only useful as a leader.
+	s.vault.SetActive(false)
+
 	// Clear the heartbeat timers on either shutdown or step down,
 	// since we are no longer responsible for TTL expirations.
 	if err := s.clearAllHeartbeatTimers(); err != nil {
@@ -455,6 +525,25 @@ func (s *Server) reconcileMember(member serf.Member) error {
 			member, err)
 		return err
 	}
+	return nil
+}
+
+// reconcileJobSummaries reconciles the summaries of all the jobs registered in
+// the system
+// COMPAT 0.4 -> 0.4.1
+func (s *Server) reconcileJobSummaries() error {
+	index, err := s.fsm.state.LatestIndex()
+	if err != nil {
+		return fmt.Errorf("unable to read latest index: %v", err)
+	}
+	s.logger.Printf("[DEBUG] leader: reconciling job summaries at index: %v", index)
+
+	args := &structs.GenericResponse{}
+	msg := structs.ReconcileJobSummariesRequestType | structs.IgnoreUnknownTypeFlag
+	if _, _, err = s.raftApply(msg, args); err != nil {
+		return fmt.Errorf("reconciliation of job summaries failed: %v", err)
+	}
+
 	return nil
 }
 

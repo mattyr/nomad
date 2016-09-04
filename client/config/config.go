@@ -99,6 +99,10 @@ type Config struct {
 	// devices and IPs.
 	GloballyReservedPorts []int
 
+	// A mapping of directories on the host OS to attempt to embed inside each
+	// task's chroot.
+	ChrootEnv map[string]string
+
 	// Options provides arbitrary key-value configuration for nomad internals,
 	// like fingerprinters and drivers. The format is:
 	//
@@ -114,9 +118,20 @@ type Config struct {
 	// ConsulConfig is this Agent's Consul configuration
 	ConsulConfig *config.ConsulConfig
 
+	// VaultConfig is this Agent's Vault configuration
+	VaultConfig *config.VaultConfig
+
 	// StatsCollectionInterval is the interval at which the Nomad client
 	// collects resource usage stats
 	StatsCollectionInterval time.Duration
+
+	// PublishNodeMetrics determines whether nomad is going to publish node
+	// level metrics to remote Telemetry sinks
+	PublishNodeMetrics bool
+
+	// PublishAllocationMetrics determines whether nomad is going to publish
+	// allocation metrics to remote Telemetry sinks
+	PublishAllocationMetrics bool
 }
 
 func (c *Config) Copy() *Config {
@@ -125,12 +140,16 @@ func (c *Config) Copy() *Config {
 	nc.Node = nc.Node.Copy()
 	nc.Servers = structs.CopySliceString(nc.Servers)
 	nc.Options = structs.CopyMapStringString(nc.Options)
+	nc.GloballyReservedPorts = structs.CopySliceInt(c.GloballyReservedPorts)
+	nc.ConsulConfig = c.ConsulConfig.Copy()
+	nc.VaultConfig = c.VaultConfig.Copy()
 	return nc
 }
 
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	return &Config{
+		VaultConfig:             config.DefaultVaultConfig(),
 		ConsulConfig:            config.DefaultConsulConfig(),
 		LogOutput:               os.Stderr,
 		Region:                  "global",

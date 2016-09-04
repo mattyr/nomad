@@ -50,26 +50,25 @@ FS Specific Options:
     Show full information.
 
   -job <job-id>
-    Use a random allocation from a specified job-id.
+    Use a random allocation from the specified job ID.
 
   -stat
     Show file stat information instead of displaying the file, or listing the directory.
 
+  -f
+    Causes the output to not stop when the end of the file is reached, but rather to
+    wait for additional output.
+
   -tail 
-	Show the files contents with offsets relative to the end of the file. If no
-	offset is given, -n is defaulted to 10.
+    Show the files contents with offsets relative to the end of the file. If no
+    offset is given, -n is defaulted to 10.
 
   -n
-	Sets the tail location in best-efforted number of lines relative to the end
-	of the file.
+    Sets the tail location in best-efforted number of lines relative to the end
+    of the file.
 
   -c
-	Sets the tail location in number of bytes relative to the end of the file.
-
-  -f
-	Causes the output to not stop when the end of the file is reached, but
-	rather to wait for additional output. 
-
+    Sets the tail location in number of bytes relative to the end of the file.
 `
 	return strings.TrimSpace(helpText)
 }
@@ -82,7 +81,7 @@ func (f *FSCommand) Run(args []string) int {
 	var verbose, machine, job, stat, tail, follow bool
 	var numLines, numBytes int64
 
-	flags := f.Meta.FlagSet("fs-list", FlagSetClient)
+	flags := f.Meta.FlagSet("fs", FlagSetClient)
 	flags.Usage = func() { f.Ui.Output(f.Help()) }
 	flags.BoolVar(&verbose, "verbose", false, "")
 	flags.BoolVar(&machine, "H", false, "")
@@ -104,7 +103,11 @@ func (f *FSCommand) Run(args []string) int {
 		} else {
 			f.Ui.Error("allocation ID is required")
 		}
+		return 1
+	}
 
+	if len(args) > 2 {
+		f.Ui.Error(f.Help())
 		return 1
 	}
 
@@ -178,14 +181,6 @@ func (f *FSCommand) Run(args []string) int {
 		return 1
 	}
 
-	if alloc.DesiredStatus == "failed" {
-		allocID := limit(alloc.ID, length)
-		msg := fmt.Sprintf(`The allocation %q failed to be placed. To see the cause, run:
-nomad alloc-status %s`, allocID, allocID)
-		f.Ui.Error(msg)
-		return 0
-	}
-
 	// Get file stat info
 	file, _, err := client.AllocFS().Stat(alloc, path, nil)
 	if err != nil {
@@ -256,7 +251,7 @@ nomad alloc-status %s`, allocID, allocID)
 		if follow {
 			r, readErr = f.followFile(client, alloc, path, api.OriginStart, 0, -1)
 		} else {
-			r, _, readErr = client.AllocFS().Cat(alloc, path, nil)
+			r, readErr = client.AllocFS().Cat(alloc, path, nil)
 		}
 
 		if readErr != nil {
@@ -267,7 +262,10 @@ nomad alloc-status %s`, allocID, allocID)
 		var offset int64 = defaultTailLines * bytesToLines
 
 		if nLines, nBytes := numLines != -1, numBytes != -1; nLines && nBytes {
-			f.Ui.Error("Both -n and -c set")
+			f.Ui.Error("Both -n and -c are not allowed")
+			return 1
+		} else if numLines < -1 || numBytes < -1 {
+			f.Ui.Error("Invalid size is specified")
 			return 1
 		} else if nLines {
 			offset = numLines * bytesToLines
@@ -287,11 +285,11 @@ nomad alloc-status %s`, allocID, allocID)
 			// This offset needs to be relative from the front versus the follow
 			// is relative to the end
 			offset = file.Size - offset
-			r, _, readErr = client.AllocFS().ReadAt(alloc, path, offset, -1, nil)
+			r, readErr = client.AllocFS().ReadAt(alloc, path, offset, -1, nil)
 
 			// If numLines is set, wrap the reader
 			if numLines != -1 {
-				r = NewLineLimitReader(r, int(numLines), int(numLines*bytesToLines))
+				r = NewLineLimitReader(r, int(numLines), int(numLines*bytesToLines), 1*time.Second)
 			}
 		}
 
@@ -316,7 +314,7 @@ func (f *FSCommand) followFile(client *api.Client, alloc *api.Allocation,
 	path, origin string, offset, numLines int64) (io.ReadCloser, error) {
 
 	cancel := make(chan struct{})
-	frames, _, err := client.AllocFS().Stream(alloc, path, origin, offset, cancel, nil)
+	frames, err := client.AllocFS().Stream(alloc, path, origin, offset, cancel, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -326,11 +324,12 @@ func (f *FSCommand) followFile(client *api.Client, alloc *api.Allocation,
 	// Create a reader
 	var r io.ReadCloser
 	frameReader := api.NewFrameReader(frames, cancel)
+	frameReader.SetUnblockTime(500 * time.Millisecond)
 	r = frameReader
 
 	// If numLines is set, wrap the reader
 	if numLines != -1 {
-		r = NewLineLimitReader(r, int(numLines), int(numLines*bytesToLines))
+		r = NewLineLimitReader(r, int(numLines), int(numLines*bytesToLines), 1*time.Second)
 	}
 
 	go func() {
@@ -338,9 +337,6 @@ func (f *FSCommand) followFile(client *api.Client, alloc *api.Allocation,
 
 		// End the streaming
 		r.Close()
-
-		// Output the last offset
-		f.Ui.Output(fmt.Sprintf("\nLast outputted offset (bytes): %d", frameReader.Offset()))
 	}()
 
 	return r, nil

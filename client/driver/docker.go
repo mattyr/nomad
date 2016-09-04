@@ -80,7 +80,7 @@ type DockerDriverConfig struct {
 	Command          string              `mapstructure:"command"`            // The Command/Entrypoint to run when the container starts up
 	Args             []string            `mapstructure:"args"`               // The arguments to the Command/Entrypoint
 	IpcMode          string              `mapstructure:"ipc_mode"`           // The IPC mode of the container - host and none
-	NetworkMode      string              `mapstructure:"network_mode"`       // The network mode of the container - host, net and none
+	NetworkMode      string              `mapstructure:"network_mode"`       // The network mode of the container - host, nat and none
 	PidMode          string              `mapstructure:"pid_mode"`           // The PID mode of the container - host and none
 	UTSMode          string              `mapstructure:"uts_mode"`           // The UTS mode of the container - host and none
 	PortMapRaw       []map[string]int    `mapstructure:"port_map"`           //
@@ -99,6 +99,7 @@ type DockerDriverConfig struct {
 	AttachStdout     bool                `mapstructure:"attach_stdout"`      // Attach to STDOUT
 	AttachStderr     bool                `mapstructure:"attach_stderr"`      // Attach to STDERR
 	ShmSize          int64               `mapstructure:"shm_size"`           // Size of /dev/shm of the container in bytes
+	WorkDir          string              `mapstructure:"work_dir"`           // Working directory inside the container
 }
 
 // Validate validates a docker driver config
@@ -234,6 +235,9 @@ func (d *DockerDriver) Validate(config map[string]interface{}) error {
 			},
 			"shm_size": &fields.FieldSchema{
 				Type: fields.TypeInt,
+			},
+			"work_dir": &fields.FieldSchema{
+				Type: fields.TypeString,
 			},
 		},
 	}
@@ -389,6 +393,7 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 	// Set environment variables.
 	d.taskEnv.SetAllocDir(allocdir.SharedAllocContainerPath)
 	d.taskEnv.SetTaskLocalDir(allocdir.TaskLocalContainerPath)
+	d.taskEnv.SetTaskLocalDir(allocdir.TaskSecretsContainerPath)
 
 	config := &docker.Config{
 		Image:        driverConfig.ImageName,
@@ -406,10 +411,15 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 		config.StdinOnce = true
 	}
 
+	if driverConfig.WorkDir != "" {
+		config.WorkingDir = driverConfig.WorkDir
+	}
+
+	memLimit := int64(task.Resources.MemoryMB) * 1024 * 1024
 	hostConfig := &docker.HostConfig{
 		// Convert MB to bytes. This is an absolute value.
-		Memory:     int64(task.Resources.MemoryMB) * 1024 * 1024,
-		MemorySwap: -1,
+		Memory:     memLimit,
+		MemorySwap: memLimit, // MemorySwap is memory + swap.
 		// Convert Mhz to shares. This is a relative value.
 		CPUShares: int64(task.Resources.CPU),
 
@@ -425,16 +435,16 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 		},
 	}
 
-	d.logger.Printf("[DEBUG] driver.docker: using %d bytes memory for %s", hostConfig.Memory, task.Config["image"])
-	d.logger.Printf("[DEBUG] driver.docker: using %d cpu shares for %s", hostConfig.CPUShares, task.Config["image"])
-	d.logger.Printf("[DEBUG] driver.docker: binding directories %#v for %s", hostConfig.Binds, task.Config["image"])
+	d.logger.Printf("[DEBUG] driver.docker: using %d bytes memory for %s", hostConfig.Memory, task.Name)
+	d.logger.Printf("[DEBUG] driver.docker: using %d cpu shares for %s", hostConfig.CPUShares, task.Name)
+	d.logger.Printf("[DEBUG] driver.docker: binding directories %#v for %s", hostConfig.Binds, task.Name)
 
 	//  set privileged mode
 	hostPrivileged := d.config.ReadBoolDefault("docker.privileged.enabled", false)
 	if driverConfig.Privileged && !hostPrivileged {
 		return c, fmt.Errorf(`Docker privileged mode is disabled on this Nomad agent`)
 	}
-	hostConfig.Privileged = hostPrivileged
+	hostConfig.Privileged = driverConfig.Privileged
 
 	// set SHM size
 	if driverConfig.ShmSize != 0 {
@@ -455,35 +465,15 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 		hostConfig.DNSSearch = append(hostConfig.DNSSearch, domain)
 	}
 
-	if driverConfig.IpcMode != "" {
-		if !hostPrivileged {
-			return c, fmt.Errorf(`Docker privileged mode is disabled on this Nomad agent, setting ipc mode not allowed`)
-		}
-		d.logger.Printf("[DEBUG] driver.docker: setting ipc mode to %s", driverConfig.IpcMode)
-	}
 	hostConfig.IpcMode = driverConfig.IpcMode
-
-	if driverConfig.PidMode != "" {
-		if !hostPrivileged {
-			return c, fmt.Errorf(`Docker privileged mode is disabled on this Nomad agent, setting pid mode not allowed`)
-		}
-		d.logger.Printf("[DEBUG] driver.docker: setting pid mode to %s", driverConfig.PidMode)
-	}
 	hostConfig.PidMode = driverConfig.PidMode
-
-	if driverConfig.UTSMode != "" {
-		if !hostPrivileged {
-			return c, fmt.Errorf(`Docker privileged mode is disabled on this Nomad agent, setting UTS mode not allowed`)
-		}
-		d.logger.Printf("[DEBUG] driver.docker: setting UTS mode to %s", driverConfig.UTSMode)
-	}
 	hostConfig.UTSMode = driverConfig.UTSMode
 
 	hostConfig.NetworkMode = driverConfig.NetworkMode
 	if hostConfig.NetworkMode == "" {
 		// docker default
-		d.logger.Println("[DEBUG] driver.docker: networking mode not specified; defaulting to bridge")
-		hostConfig.NetworkMode = "bridge"
+		d.logger.Printf("[DEBUG] driver.docker: networking mode not specified; defaulting to %s", defaultNetworkMode)
+		hostConfig.NetworkMode = defaultNetworkMode
 	}
 
 	// Setup port mapping and exposed ports
@@ -510,8 +500,8 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 			hostPortStr := strconv.Itoa(port.Value)
 			containerPort := docker.Port(strconv.Itoa(containerPortInt))
 
-			publishedPorts[containerPort+"/tcp"] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: hostPortStr}}
-			publishedPorts[containerPort+"/udp"] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: hostPortStr}}
+			publishedPorts[containerPort+"/tcp"] = getPortBinding(network.IP, hostPortStr)
+			publishedPorts[containerPort+"/udp"] = getPortBinding(network.IP, hostPortStr)
 			d.logger.Printf("[DEBUG] driver.docker: allocated port %s:%d -> %d (static)", network.IP, port.Value, port.Value)
 
 			exposedPorts[containerPort+"/tcp"] = struct{}{}
@@ -531,8 +521,8 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 			hostPortStr := strconv.Itoa(port.Value)
 			containerPort := docker.Port(strconv.Itoa(containerPortInt))
 
-			publishedPorts[containerPort+"/tcp"] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: hostPortStr}}
-			publishedPorts[containerPort+"/udp"] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: hostPortStr}}
+			publishedPorts[containerPort+"/tcp"] = getPortBinding(network.IP, hostPortStr)
+			publishedPorts[containerPort+"/udp"] = getPortBinding(network.IP, hostPortStr)
 			d.logger.Printf("[DEBUG] driver.docker: allocated port %s:%d -> %d (mapped)", network.IP, port.Value, containerPortInt)
 
 			exposedPorts[containerPort+"/tcp"] = struct{}{}
@@ -892,7 +882,7 @@ func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, er
 		}
 	}
 	if !found {
-		return nil, fmt.Errorf("Failed to find container %s: %v", pid.ContainerID, err)
+		return nil, fmt.Errorf("Failed to find container %s", pid.ContainerID)
 	}
 	exec, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
 	if err != nil {
@@ -1035,7 +1025,7 @@ func (h *DockerHandle) run() {
 	}
 
 	// Remove the container
-	if err := h.client.RemoveContainer(docker.RemoveContainerOptions{ID: h.containerID, Force: true}); err != nil {
+	if err := h.client.RemoveContainer(docker.RemoveContainerOptions{ID: h.containerID, RemoveVolumes: true, Force: true}); err != nil {
 		h.logger.Printf("[ERR] driver.docker: error removing container: %v", err)
 	}
 

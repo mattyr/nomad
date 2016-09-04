@@ -70,9 +70,13 @@ Datacenters = dc1
 Status      = running
 Periodic    = false
 
+Summary
+Task Group  Queued  Starting  Running  Failed  Complete  Lost
+cache       0       0         1        0       0         0
+
 Allocations
-ID        Eval ID   Node ID   Task Group  Desired  Status
-dadcdb81  61b0b423  72687b1a  cache       run      running
+ID        Eval ID   Node ID   Task Group  Desired  Status   Created At
+dadcdb81  61b0b423  72687b1a  cache       run      running  06/23/16 01:41:13 UTC
 ```
 
 Here we can see that the result of our evaluation was the creation of an
@@ -89,6 +93,7 @@ Name          = example.cache[0]
 Node ID       = 72687b1a
 Job ID        = example
 Client Status = running
+Created At    = 06/23/16 01:41:13 UTC
 
 Task "redis" is "running"
 Task Resources
@@ -105,16 +110,10 @@ We can see that Nomad reports the state of the allocation as well as its
 current resource usage. By supplying the `-stats` flag, more detailed resource
 usage statistics will be reported.
 
-To inspect the file system of a running allocation, we can use the [`fs`
-command](/docs/commands/fs.html):
+To see the logs of a task, we can use the [logs command](/docs/commands/logs.html):
 
 ```
-$ nomad fs 8ba85cef alloc/logs
-Mode        Size    Modified Time          Name
--rw-rw-r--  0 B     15/03/16 15:40:56 PDT  redis.stderr.0
--rw-rw-r--  2.3 kB  15/03/16 15:40:57 PDT  redis.stdout.0
-
-$ nomad fs 8ba85cef alloc/logs/redis.stdout.0
+$ nomad logs 8ba85cef redis
                  _._
             _.-``__ ''-._
        _.-``    `.  `_.  ''-._           Redis 3.2.1 (00000000/0) 64 bit
@@ -151,7 +150,7 @@ count = 3
 
 Once you have finished modifying the job specification, use [`plan`
 command](/docs/commands/plan.html) to invoke a dry-run of the scheduler to see
-what would happen if your ran the updated job:
+what would happen if you ran the updated job:
 
 ```
 $ nomad plan example.nomad

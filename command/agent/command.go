@@ -16,12 +16,14 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+	"github.com/armon/go-metrics/circonus"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/go-checkpoint"
 	"github.com/hashicorp/go-syslog"
 	"github.com/hashicorp/logutils"
 	"github.com/hashicorp/nomad/helper/flag-slice"
 	"github.com/hashicorp/nomad/helper/gated-writer"
+	"github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/hashicorp/scada-client/scada"
 	"github.com/mitchellh/cli"
 )
@@ -63,6 +65,7 @@ func (c *Command) readConfig() *Config {
 		Client: &ClientConfig{},
 		Ports:  &Ports{},
 		Server: &ServerConfig{},
+		Vault:  &config.VaultConfig{},
 	}
 
 	flags := flag.NewFlagSet("agent", flag.ContinueOnError)
@@ -103,6 +106,12 @@ func (c *Command) readConfig() *Config {
 	flags.StringVar(&cmdConfig.Atlas.Infrastructure, "atlas", "", "")
 	flags.BoolVar(&cmdConfig.Atlas.Join, "atlas-join", false, "")
 	flags.StringVar(&cmdConfig.Atlas.Token, "atlas-token", "", "")
+
+	// Vault options
+	flags.BoolVar(&cmdConfig.Vault.Enabled, "vault-enabled", false, "")
+	flags.BoolVar(&cmdConfig.Vault.AllowUnauthenticated, "vault-allow-unauthenticated", false, "")
+	flags.StringVar(&cmdConfig.Vault.Token, "vault-token", "", "")
+	flags.StringVar(&cmdConfig.Vault.Addr, "vault-address", "", "")
 
 	if err := flags.Parse(c.args); err != nil {
 		return nil
@@ -483,7 +492,7 @@ WAIT:
 	// Check if this is a SIGHUP
 	if sig == syscall.SIGHUP {
 		if conf := c.handleReload(config); conf != nil {
-			config = conf
+			*config = *conf
 		}
 		goto WAIT
 	}
@@ -582,6 +591,43 @@ func (c *Command) setupTelementry(config *Config) error {
 		if err != nil {
 			return err
 		}
+		fanout = append(fanout, sink)
+	}
+
+	// Configure the Circonus sink
+	if telConfig.CirconusAPIToken != "" || telConfig.CirconusCheckSubmissionURL != "" {
+		cfg := &circonus.Config{}
+		cfg.Interval = telConfig.CirconusSubmissionInterval
+		cfg.CheckManager.API.TokenKey = telConfig.CirconusAPIToken
+		cfg.CheckManager.API.TokenApp = telConfig.CirconusAPIApp
+		cfg.CheckManager.API.URL = telConfig.CirconusAPIURL
+		cfg.CheckManager.Check.SubmissionURL = telConfig.CirconusCheckSubmissionURL
+		cfg.CheckManager.Check.ID = telConfig.CirconusCheckID
+		cfg.CheckManager.Check.ForceMetricActivation = telConfig.CirconusCheckForceMetricActivation
+		cfg.CheckManager.Check.InstanceID = telConfig.CirconusCheckInstanceID
+		cfg.CheckManager.Check.SearchTag = telConfig.CirconusCheckSearchTag
+		cfg.CheckManager.Broker.ID = telConfig.CirconusBrokerID
+		cfg.CheckManager.Broker.SelectTag = telConfig.CirconusBrokerSelectTag
+
+		if cfg.CheckManager.API.TokenApp == "" {
+			cfg.CheckManager.API.TokenApp = "nomad"
+		}
+
+		if cfg.CheckManager.Check.InstanceID == "" {
+			if config.NodeName != "" && config.Datacenter != "" {
+				cfg.CheckManager.Check.InstanceID = fmt.Sprintf("%s:%s", config.NodeName, config.Datacenter)
+			}
+		}
+
+		if cfg.CheckManager.Check.SearchTag == "" {
+			cfg.CheckManager.Check.SearchTag = "service:nomad"
+		}
+
+		sink, err := circonus.NewCirconusSink(cfg)
+		if err != nil {
+			return err
+		}
+		sink.Start()
 		fanout = append(fanout, sink)
 	}
 
@@ -814,6 +860,23 @@ Client Options:
   -network-speed
     The default speed for network interfaces in MBits if the link speed can not
     be determined dynamically.
+
+Vault Options:
+
+  -vault-enabled
+    Whether to enable or disable Vault integration.
+
+  -vault-address=<addr>
+    The address to communicate with Vault. This should be provided with the http://
+    or https:// prefix.
+
+  -vault-token=<token>
+    The Vault token used to derive tokens from Vault on behalf of clients.
+    This only needs to be set on Servers.
+
+  -vault-allow-unauthenticated
+    Whether to allow jobs to be sumbitted that request Vault Tokens but do not
+    authentication. The flag only applies to Servers.
 
 Atlas Options:
 
