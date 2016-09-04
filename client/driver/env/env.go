@@ -162,7 +162,7 @@ func (t *TaskEnvironment) Build() *TaskEnvironment {
 		t.FullEnv[TaskLocalDir] = t.TaskDir
 	}
 	if t.SecretDir != "" {
-		t.TaskEnv[SecretDir] = t.SecretDir
+		t.FullEnv[SecretDir] = t.SecretDir
 	}
 
 	// Build the resource limits
