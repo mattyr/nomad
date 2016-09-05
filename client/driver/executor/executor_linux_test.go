@@ -16,7 +16,7 @@ import (
 )
 
 func testExecutorContextWithChroot(t *testing.T) *ExecutorContext {
-	taskEnv := env.NewTaskEnvironment(mock.Node())
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false)
 	task, allocDir := mockAllocDir(t)
 	ctx := &ExecutorContext{
 		TaskEnv:  taskEnv,

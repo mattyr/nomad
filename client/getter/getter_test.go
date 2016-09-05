@@ -38,7 +38,7 @@ func TestGetArtifact_FileAndChecksum(t *testing.T) {
 	}
 
 	// Download the artifact
-	taskEnv := env.NewTaskEnvironment(mock.Node())
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false)
 	if err := GetArtifact(taskEnv, artifact, taskDir); err != nil {
 		t.Fatalf("GetArtifact failed: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestGetArtifact_File_RelativeDest(t *testing.T) {
 	}
 
 	// Download the artifact
-	taskEnv := env.NewTaskEnvironment(mock.Node())
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false)
 	if err := GetArtifact(taskEnv, artifact, taskDir); err != nil {
 		t.Fatalf("GetArtifact failed: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestGetArtifact_InvalidChecksum(t *testing.T) {
 	}
 
 	// Download the artifact and expect an error
-	taskEnv := env.NewTaskEnvironment(mock.Node())
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false)
 	if err := GetArtifact(taskEnv, artifact, taskDir); err == nil {
 		t.Fatalf("GetArtifact should have failed")
 	}
@@ -190,7 +190,7 @@ func TestGetArtifact_Archive(t *testing.T) {
 		},
 	}
 
-	taskEnv := env.NewTaskEnvironment(mock.Node())
+	taskEnv := env.NewTaskEnvironment(mock.Node(), false)
 	if err := GetArtifact(taskEnv, artifact, taskDir); err != nil {
 		t.Fatalf("GetArtifact failed: %v", err)
 	}
