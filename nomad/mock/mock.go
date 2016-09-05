@@ -95,6 +95,7 @@ func Job() *structs.Job {
 						Config: map[string]interface{}{
 							"command": "/bin/date",
 						},
+						ExcludeNomadEnv: false,
 						Env: map[string]string{
 							"FOO": "bar",
 						},
@@ -188,7 +189,8 @@ func SystemJob() *structs.Job {
 						Config: map[string]interface{}{
 							"command": "/bin/date",
 						},
-						Env: map[string]string{},
+						Env:             map[string]string{},
+						ExcludeNomadEnv: false,
 						Resources: &structs.Resources{
 							CPU:      500,
 							MemoryMB: 256,

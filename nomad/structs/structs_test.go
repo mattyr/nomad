@@ -134,6 +134,7 @@ func testJob() *Job {
 						Env: map[string]string{
 							"FOO": "bar",
 						},
+						ExcludeNomadEnv: false,
 						Artifacts: []*TaskArtifact{
 							{
 								GetterSource: "http://foo.com",

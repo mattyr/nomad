@@ -1470,6 +1470,12 @@ func TestTaskGroupDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeAdded,
+								Name: "ExcludeNomadEnv",
+								Old:  "",
+								New:  "false",
+							},
+							{
+								Type: DiffTypeAdded,
 								Name: "KillTimeout",
 								Old:  "",
 								New:  "0",
@@ -1500,6 +1506,12 @@ func TestTaskGroupDiff(t *testing.T) {
 								Type: DiffTypeDeleted,
 								Name: "Driver",
 								Old:  "docker",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
+								Name: "ExcludeNomadEnv",
+								Old:  "false",
 								New:  "",
 							},
 							{
